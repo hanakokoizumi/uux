@@ -1,0 +1,145 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+enum FPS {
+  FPS_UNKNOWN = 0;
+  FPS_30 = 1;
+  FPS_60 = 2;
+  FPS_90 = 3;
+  FPS_144 = 4;
+}
+
+enum ClientType {
+  Client_UNSPECIFIED = 0;
+  Client_IOS = 1;
+  Client_ANDROID = 2;
+  Client_WINDOWS = 3;
+  Client_MAC = 4;
+}
+
+enum VideoQuality {
+  VideoQuality_UNKNOWN = 0;
+  VideoQuality_Fast = 1;
+  VideoQuality_General = 2;
+  VideoQuality_HD = 3;
+  VideoQuality_Bluray = 4;
+  VideoQuality_Auto = 5;
+  VideoQuality_Custom = 6;
+}
+
+enum CodecType {
+  CodecType_UNKNOWN = 0;
+  CodecType_H264 = 1;
+  CodecType_H265 = 2;
+}
+
+enum CaptureMode {
+  CaptureMode_UNKNOWN = 0;
+  CaptureMode_DESKTOP = 1;
+  CaptureMode_WINDOW = 2;
+  CaptureMode_MUMU = 3;
+  CaptureMode_HOOK = 4;
+  CaptureMode_GLOBAL = 5;
+}
+
+enum ScreenType {
+  ScreenType_Physics = 0;
+  ScreenType_Virtual = 1;
+  ScreenType_Super = 2;
+}
+
+enum ChooseResolutionType {
+  ChooseType_UNKNOWN = 0;
+  ChooseType_DEFAULT = 1;
+  ChooseType_FOLLOW_LOCAL = 2;
+  ChooseType_FOLLOW_REMOTE = 3;
+  ChooseType_RESOLUTION = 4;
+}
+
+enum ChromaFormat {
+  ChromaFormat_UNKNOWN = 0;
+  ChromaFormat_420 = 1;
+  ChromaFormat_422 = 2;
+  ChromaFormat_444 = 3;
+  ChromaFormat_400 = 4;
+}
+
+enum ControlConnectType {
+  ControlConnectType_UNKNOWN = 0;
+  ControlConnectType_Normal = 1;
+  ControlConnectType_Assistance = 2;
+}
+
+enum FileType {
+  FT_Dir = 0;
+  FT_DirLink = 2;
+  FT_DirDrive = 3;
+  FT_File = 4;
+  FT_FileLink = 5;
+}
+
+enum FileOperationStrategy {
+  FOS_UNSPECIFIED = 0;
+  FOS_OVERRIDE = 1;
+  FOS_DUPLICATE = 2;
+  FOS_SKIP = 3;
+  FOS_RESUME = 4;
+}
+
+enum FileTransferError {
+  FT_UNSPECIFIED = 0;
+  FT_SUCCEEDED = 1;
+  FT_UNEXPECTED_ERROR = 2;
+  FT_PROTOCOL_ERROR = 3;
+  FT_PERMISSION_DENIED = 4;
+  FT_OUT_OF_DISK_SPACE = 5;
+  FT_IO_ERROR = 6;
+  FT_CANCELED = 7;
+  FT_NOT_LOGGED_IN = 8;
+  FT_FILE_NOT_FOUND = 9;
+  FT_PAUSED = 10;
+  FT_FILE_NOT_RESUMABLE = 11;
+}
+
+enum ClipboardError {
+  CB_UNSPECIFIED = 0;
+  CB_SUCCEEDED = 1;
+  CB_FAILED = 2;
+}
+
+enum PrivateScreenType {
+  PS_UNSPECIFIED = 0;
+  PS_NOT_SET = 1;
+  PS_NORMAL_PRIVACY = 2;
+  PS_ENHANCED_PRIVACY = 3;
+}
+
+enum PermissionAuthState {
+  PERMISSION_STATE_UNKOWN = 0;
+  PERMISSION_STATE_REJECT = 1;
+  PERMISSION_STATE_ALLOW = 2;
+}
+
+enum BuiltinScreenType {
+  BS_UNKOWN = 0;
+  BS_BUILTIN = 1;
+  BS_NOT_BUILTIN = 2;
+}
+
+enum SystemSoundSupport {
+  SS_UNKOWN = 0;
+  SS_NONSUPPORT = 1;
+  SS_SUPPORT = 2;
+}
+
+enum ScreenOrientation {
+  SO_UNSPECIFIED = 0;
+  SO_LANDSCAPE = 1;
+  SO_PORTRAIT = 2;
+}
+
+message ScreenResolution {
+  int32 width = 1;
+  int32 height = 2;
+}

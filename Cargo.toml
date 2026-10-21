@@ -1,0 +1,69 @@
+[package]
+name = "uux"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.95"
+description = "UUX — Linux-native remote desktop client for UU, built with Rust and egui"
+
+[workspace]
+members = ["vendor/webrtc-sctp", "vendor/webrtc-util"]
+exclude = ["vendor/eframe"]
+default-members = ["."]
+resolver = "3"
+
+[dependencies]
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal"] }
+tokio-util = "0.7"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "socks"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+sha1 = { version = "0.10", features = ["oid"] }
+hmac = "0.12"
+hex = "0.4"
+rsa = "0.9"
+directories = "6"
+qrcode = "0.14"
+prost = "0.14"
+bytes = "1"
+flate2 = "1"
+webrtc = "0.17"
+ffmpeg-next = "9"
+cpal = "0.17"
+opus = "0.3"
+arboard = { version = "3", features = ["wayland-data-control"] }
+tempfile = "3"
+libc = "0.2"
+socket2 = "0.6"
+log = "0.4"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }
+vt100 = "=0.16.2"
+rmcp = { version = "=3.6.0", features = ["transport-io"] }
+
+[build-dependencies]
+prost-build = "0.14"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[patch.crates-io]
+# Keep hidden immediate viewports off the presentation path; see UU-PATCH.md.
+eframe = { path = "vendor/eframe" }
+# Scoped transport timing/framing patches; see vendor/webrtc-sctp/UU-PATCH.md.
+webrtc-sctp = { path = "vendor/webrtc-sctp" }
+# Per-connection OS socket configuration, preserving normal ICE gathering.
+webrtc-util = { path = "vendor/webrtc-util" }
+
+
+# Forward desktop launch activation tokens to the existing Wayland window.
+winit = { path = "vendor/winit" }

@@ -1,0 +1,18 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+message PortMappingFrame {
+  enum FrameType {
+    SYN = 0;
+    FIN = 1;
+    DATA = 2;
+    SYN_ACK = 3;
+    DATA_ACK = 4;
+  }
+  uint64 session_id = 1;
+  uint64 rule_id = 2;
+  uint64 stream_id = 3;
+  .gv_pb.PortMappingFrame.FrameType type = 4;
+  bytes payload = 5;
+}

@@ -1,0 +1,193 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "defines.proto";
+
+message FileRename {
+  string path = 1;
+  string new_name = 2;
+}
+
+message FileDirCreate {
+  string path = 1;
+}
+
+message FileRemoveFile {
+  string path = 1;
+}
+
+message FileOperationResult {
+  .gv_pb.FileTransferError file_error = 1;
+  string err_msg = 2;
+  string path = 3;
+}
+
+message FileExist {
+  string path = 1;
+  repeated string names = 2;
+}
+
+message FileExistResult {
+  string name = 1;
+  bool has_same = 2;
+  bool has_transfering = 3;
+}
+
+message FileExistResponse {
+  string path = 1;
+  repeated .gv_pb.FileExistResult results = 2;
+}
+
+message FileEntry {
+  .gv_pb.FileType entry_type = 1;
+  string name = 2;
+  uint64 size = 3;
+  uint64 modified_time = 4;
+  string full_path = 5;
+  string icon_type = 6;
+}
+
+message TaskId {
+  int32 task_id = 1;
+  int32 file_index = 2;
+}
+
+message ReadDir {
+  .gv_pb.TaskId id = 1;
+  string path = 2;
+}
+
+message DirectoryData {
+  repeated .gv_pb.FileEntry entries = 1;
+}
+
+message FileDirectory {
+  .gv_pb.TaskId id = 1;
+  string path = 2;
+  repeated .gv_pb.FileEntry entries = 3;
+  .gv_pb.FileTransferError file_error = 4;
+  bytes dir_data = 5;
+}
+
+message FileRemoveDir {
+  .gv_pb.TaskId id = 1;
+  string path = 2;
+  bool recursive = 3;
+}
+
+message FileTransferResult {
+  .gv_pb.TaskId id = 1;
+  .gv_pb.FileTransferError file_error = 2;
+  string err_msg = 3;
+}
+
+message FileTransferComplete {
+  .gv_pb.TaskId id = 1;
+  .gv_pb.FileTransferError error = 2;
+}
+
+message FileTransferAsk {
+  .gv_pb.TaskId id = 1;
+  uint64 last_modified = 2;
+  uint64 file_size = 3;
+}
+
+message FileTransferConfirm {
+  .gv_pb.TaskId id = 1;
+  bool skip = 2;
+  .gv_pb.FileTransferError err = 3;
+  uint64 resume_point = 4;
+}
+
+message FileTransferBlock {
+  .gv_pb.TaskId id = 1;
+  int32 block_id = 2;
+  bytes data = 3;
+}
+
+message FileTransferBlockConfirm {
+  .gv_pb.TaskId id = 1;
+  int32 block_id = 2;
+  .gv_pb.FileTransferError err = 3;
+  int32 block_len = 4;
+}
+
+message FileInfo {
+  string rel_path = 1;
+  uint64 size = 2;
+  uint64 modified_time = 3;
+}
+
+message FileList {
+  repeated .gv_pb.FileInfo files = 1;
+}
+
+message DirectorySizeRead {
+  .gv_pb.TaskId id = 1;
+  uint64 size = 2;
+}
+
+message FileTransferSendRequest {
+  .gv_pb.TaskId id = 1;
+  string path = 2;
+  bytes list_data = 3;
+}
+
+message FileTransferSendResponse {
+  .gv_pb.TaskId id = 1;
+  .gv_pb.FileTransferError err = 2;
+  repeated .gv_pb.FileInfo files = 3;
+  string folder_name = 4;
+  bytes list_data = 5;
+}
+
+message ClearSendTemp {
+  string task_unique_id = 1;
+}
+
+message FileTransferReceiveRequest {
+  .gv_pb.TaskId id = 1;
+  string path = 2;
+  repeated .gv_pb.FileInfo files = 3;
+  .gv_pb.FileOperationStrategy file_op_strategy = 4;
+  string folder_name = 5;
+  bytes list_data = 6;
+  string task_unique_id = 7;
+}
+
+message FileTransferReceiveResponse {
+  .gv_pb.TaskId id = 1;
+  repeated .gv_pb.FileInfo files = 2;
+  .gv_pb.FileTransferError err = 3;
+}
+
+message FileTransferFtpRequest {
+  oneof which {
+    .gv_pb.FileTransferReceiveRequest receive_request = 1;
+    .gv_pb.FileTransferSendRequest send_request = 2;
+    .gv_pb.FileTransferAsk file_ask = 3;
+    .gv_pb.FileTransferBlock file_block = 4;
+    .gv_pb.FileRename rename = 5;
+    .gv_pb.FileDirCreate dir_create = 6;
+    .gv_pb.FileRemoveFile remove_file = 7;
+    .gv_pb.FileRemoveDir remove_dir = 8;
+    .gv_pb.FileTransferComplete complete = 9;
+    .gv_pb.ReadDir read_dir = 10;
+    .gv_pb.FileExist file_exist = 11;
+    .gv_pb.ClearSendTemp clear_send_temp = 12;
+    .gv_pb.DirectorySizeRead dir_size_read = 13;
+  }
+}
+
+message FileTransferFtpResponse {
+  oneof which {
+    .gv_pb.FileTransferReceiveResponse receive_response = 1;
+    .gv_pb.FileTransferSendResponse send_response = 2;
+    .gv_pb.FileTransferConfirm file_confirm = 3;
+    .gv_pb.FileTransferBlockConfirm block_confirm = 4;
+    .gv_pb.FileOperationResult operation_result = 5;
+    .gv_pb.FileTransferResult result = 6;
+    .gv_pb.FileDirectory file_directory = 7;
+    .gv_pb.FileExistResponse file_exist_response = 8;
+  }
+}

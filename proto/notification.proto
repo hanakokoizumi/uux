@@ -1,0 +1,56 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "defines.proto";
+
+message SecureDesktopState {
+  bool is_locked = 1;
+  bool is_sas_shown = 2;
+  int32 pos_x = 3;
+  int32 pos_y = 4;
+  bool is_support_auto_logon = 5;
+}
+
+message CursorShape {
+  int32 pos_x = 1;
+  int32 pos_y = 2;
+  int32 width = 3;
+  int32 height = 4;
+  bytes byte_value = 5;
+  int32 cursor_type = 6;
+  double coordinate_x_scale = 7;
+  double coordinate_y_scale = 8;
+  int32 screen_id = 9;
+}
+
+message PermissionState {
+  bool assistant = 1;
+}
+
+message RemoteAssistFileTransferState {
+  bool enabled = 1;
+}
+
+message PrivateScreenState {
+  int32 error_code = 1;
+  .gv_pb.PrivateScreenType req_privacy_type = 2;
+  .gv_pb.PrivateScreenType cur_privacy_type = 3;
+}
+
+message SystemStateChange {
+  oneof which {
+    .gv_pb.SecureDesktopState sd_state = 1;
+    .gv_pb.CursorShape cursor_shape = 2;
+    .gv_pb.PermissionState permission_state = 3;
+    .gv_pb.RemoteAssistFileTransferState remote_assist_file_transfer_state = 4;
+    .gv_pb.PrivateScreenState private_screen_state = 5;
+  }
+}
+
+message QuerySystemState {
+  enum StateId {
+    SS_ID_NONE = 0;
+    SS_ID_SECURE_DESKTOP_STATE = 1;
+  }
+  .gv_pb.QuerySystemState.StateId id = 1;
+}

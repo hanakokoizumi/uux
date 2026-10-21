@@ -1,0 +1,154 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "defines.proto";
+
+message ClipboardFormat {
+  uint32 id = 1;
+  string name = 2;
+}
+
+message DragDropAutoSave {
+  string dest_path = 1;
+}
+
+message DragDropAutoSaveComplete {
+  uint32 total_count = 1;
+  uint32 success_count = 2;
+  string first_file_name = 3;
+}
+
+message DragDropAutoSaveCompleteResponse {
+  .gv_pb.ClipboardError err = 1;
+}
+
+message DragDropOleDrop {
+  double target_x = 1;
+  double target_y = 2;
+  int32 screen_id = 3;
+}
+
+message ClipboardFormatListRequest {
+  repeated .gv_pb.ClipboardFormat formats = 1;
+  int32 has_action = 2;
+  oneof drag_drop_action {
+    .gv_pb.DragDropAutoSave auto_save = 3;
+    .gv_pb.DragDropOleDrop ole_drop = 4;
+  }
+}
+
+message ClipboardFormatListResponse {
+}
+
+message ClipboardFormatDataAsk {
+  uint32 format_id = 1;
+  string block_key = 2;
+  string format_name = 3;
+}
+
+message ClipboardFormatDataConfirm {
+  .gv_pb.ClipboardError err = 1;
+  string block_key = 2;
+  int32 block_count = 3;
+}
+
+message ClipboardDataBlock {
+  string block_key = 1;
+  int32 block_id = 2;
+  bytes data = 3;
+}
+
+message ClipboardDataBlockConfirm {
+  string block_key = 1;
+  int32 block_id = 2;
+  .gv_pb.ClipboardError err = 3;
+}
+
+message ClipboardFileDescriptor {
+  string file_name = 1;
+  uint32 file_attributes = 2;
+  uint64 last_write_time = 3;
+  uint64 file_size = 4;
+}
+
+message ClipboardFileDescriptorListRequest {
+  uint32 task_id = 1;
+}
+
+message ClipboardFileDescriptorListResponse {
+  uint32 task_id = 1;
+  uint32 segment_count = 2;
+  .gv_pb.ClipboardError err = 3;
+}
+
+message ClipboardFileDescriptorSegment {
+  uint32 task_id = 1;
+  uint32 segment_id = 2;
+  repeated .gv_pb.ClipboardFileDescriptor file_descs = 3;
+}
+
+message ClipboardFileDescriptorSegmentConfirm {
+  uint32 task_id = 1;
+  uint32 segment_id = 2;
+  .gv_pb.ClipboardError err = 3;
+}
+
+message ClipboardFileContentsRequest {
+  uint32 task_id = 1;
+  uint32 list_index = 2;
+  uint32 flags = 3;
+  uint64 pos_offset = 4;
+  uint32 requested_len = 5;
+}
+
+message ClipboardFileContentsResponse {
+  uint32 task_id = 1;
+  bytes data = 2;
+  .gv_pb.ClipboardError err = 3;
+  uint64 pos_offset = 4;
+  uint32 list_index = 5;
+}
+
+message ClipboardFileCancelRequest {
+  uint32 task_id = 1;
+}
+
+message ClipboardFileCancelResponse {
+  uint32 task_id = 1;
+  .gv_pb.ClipboardError err = 2;
+}
+
+message ClipboardTextChangeRequest {
+  uint32 format_id = 1;
+  string data = 2;
+}
+
+message ClipboardTextChangeResponse {
+  .gv_pb.ClipboardError err = 1;
+}
+
+message ClipboardRequest {
+  oneof which {
+    .gv_pb.ClipboardFormatListRequest format_list = 1;
+    .gv_pb.ClipboardFormatDataAsk format_data_ask = 2;
+    .gv_pb.ClipboardDataBlock data_block = 3;
+    .gv_pb.ClipboardFileDescriptorListRequest file_desc_list_request = 4;
+    .gv_pb.ClipboardFileContentsRequest file_contents_request = 5;
+    .gv_pb.ClipboardFileCancelRequest cancel_request = 6;
+    .gv_pb.ClipboardFileDescriptorSegment desc_segment = 7;
+    .gv_pb.DragDropAutoSaveComplete auto_save_complete = 8;
+  }
+}
+
+message ClipboardResponse {
+  oneof which {
+    .gv_pb.ClipboardFormatListResponse format_list_response = 1;
+    .gv_pb.ClipboardFormatDataConfirm format_data_confirm = 2;
+    .gv_pb.ClipboardDataBlockConfirm data_block_confirm = 3;
+    .gv_pb.ClipboardFileDescriptorListResponse file_desc_list_response = 4;
+    .gv_pb.ClipboardFileContentsResponse file_contents_response = 5;
+    .gv_pb.ClipboardFileCancelResponse cancel_response = 6;
+    .gv_pb.ClipboardFileDescriptorSegmentConfirm desc_segment_confirm = 7;
+    .gv_pb.DragDropAutoSaveCompleteResponse auto_save_complete_response = 8;
+  }
+}

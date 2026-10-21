@@ -1,0 +1,234 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+// Terminal environment negotiation, recovered from 4.40.1.2090 descriptors.
+message CheckEnvReq {}
+message CheckEnvResp {
+  int32 code = 1;
+  string message = 2;
+}
+import "defines.proto";
+
+message CaptureSettingRequest {
+  .gv_pb.FPS fps = 1;
+  .gv_pb.VideoQuality frame_quality = 2;
+  bool cursor_capture = 3;
+  int32 screen_id = 4;
+  int32 resolution_width = 5;
+  int32 resolution_height = 6;
+  .gv_pb.ChromaFormat chorma_format = 7;
+  int32 max_custom_bitrate = 8;
+  int32 dpi_scale = 9;
+  .gv_pb.ChooseResolutionType resolution_type = 10;
+  bool enable_hdr = 11;
+  .gv_pb.VideoQuality auto_frame_quality = 12;
+  .gv_pb.CodecType codec_type = 13;
+  int32 max_scale_width = 14;
+  int32 max_scale_height = 15;
+  int32 resolution_pixel_width = 16;
+  int32 resolution_pixel_height = 17;
+  int32 fpsCount = 18;
+}
+
+message FpsSettingRequest {
+  .gv_pb.FPS fps = 1;
+}
+
+message VideoQualitySettingReqeust {
+  .gv_pb.VideoQuality frame_quality = 1;
+}
+
+message CursorSettingReqeust {
+  bool cursor_capture = 1;
+}
+
+message ResolutionSettingRequest {
+  int32 resolution_width = 1;
+  int32 resolution_height = 2;
+}
+
+message Error {
+  int32 error_code = 1;
+  string error_message = 2;
+  string error_detail = 3;
+}
+
+message CaptureSettingResponse {
+  repeated .gv_pb.Error errors = 1;
+}
+
+message PrivateScreenSettingRequest {
+  bool enable = 1;
+  .gv_pb.PrivateScreenType privacy_type = 2;
+  string setting_source = 3;
+}
+
+message PrivateScreenSettingResponse {
+  int32 error_code = 1;
+  .gv_pb.PrivateScreenType req_privacy_type = 2;
+  .gv_pb.PrivateScreenType cur_privacy_type = 3;
+}
+
+message VirtualMouseSwitchRequest {
+  bool enable = 1;
+}
+
+message VirtualMouseSwitchResponse {
+  int32 error_code = 1;
+}
+
+message CreateVirtualDisplayRequest {
+  repeated .gv_pb.ScreenResolution local_resolution = 1;
+  int32 virtual_display_count = 2;
+}
+
+message CreateVirtualDisplayResponse {
+  int32 error_code = 1;
+}
+
+message RemoveVirtualDisplayRequest {
+  repeated int32 screen_id = 1;
+}
+
+message RemoveVirtualDisplayResponse {
+  int32 error_code = 1;
+}
+
+message QuitSuperScreenRequest {
+}
+
+message QuitSuperScreenResponse {
+  int32 error_code = 1;
+}
+
+message SendVideoTrackRequest {
+  repeated int32 video_track_index = 1;
+}
+
+message SendVideoTrackResponse {
+  int32 error_code = 1;
+}
+
+message QueryPluginSettingRequest {
+  string plugin_id = 1;
+}
+
+message QueryPluginSettingResponse {
+  int32 error_code = 1;
+  bool enable = 2;
+  string plugin_id = 3;
+}
+
+message UpdatePluginSettingRequest {
+  string plugin_id = 1;
+  bool enable = 2;
+}
+
+message UpdatePluginSettingResponse {
+  int32 error_code = 1;
+  uint64 plugin_package_size = 2;
+  string plugin_id = 3;
+  bool enable = 4;
+}
+
+message StartDownloadAndInstallPluginRequest {
+  string plugin_id = 1;
+}
+
+message StartDownloadAndInstallPluginResponse {
+  int32 error_code = 1;
+  string plugin_id = 2;
+}
+
+message PluginEnableNotificationRequest {
+  string plugin_id = 1;
+}
+
+message PluginEnableNotificationResponse {
+  int32 error_code = 1;
+  string plugin_id = 2;
+}
+
+message PluginNotificationRequest {
+  string plugin_id = 1;
+  int32 notification_type = 2;
+}
+
+message PluginNotificationResponse {
+  int32 error_code = 1;
+  string plugin_id = 2;
+}
+
+message VirtualAudioDriverPolicyRequest {
+  int32 policy = 1;
+}
+
+message VirtualAudioDriverPolicyResponse {
+  int32 error_code = 1;
+}
+
+message SendFlipScreenRequest {
+  .gv_pb.ScreenOrientation screen_orientation = 1;
+}
+
+message SendFlipScreenResponse {
+  int32 error_code = 1;
+}
+
+message QuickLaunchScanRequest {
+}
+
+message QuickLaunchAppItem {
+  string app_key = 1;
+  string name = 2;
+  string icon_url = 3;
+  string target_path = 4;
+  string app_id = 5;
+}
+
+message QuickLaunchScanResponse {
+  int32 error_code = 1;
+  string error_message = 2;
+  repeated .gv_pb.QuickLaunchAppItem apps = 3;
+}
+
+message QuickLaunchAppIconRequest {
+  string app_key = 1;
+}
+
+message QuickLaunchAppIconResponse {
+  int32 error_code = 1;
+  string error_message = 2;
+  string app_key = 3;
+  bytes byte_value = 4;
+}
+
+message UpdateScreenSaverRequest {
+}
+
+message UpdateScreenSaverResponse {
+  int32 error_code = 1;
+}
+
+message EnterSuperScreenFpsNotSupport {
+  int32 fps_count = 1;
+}
+
+message EnterSuperScreenRequest {
+  enum EnterReason {
+    REASON_UNKNOWN = 0;
+    REASON_MANUAL = 1;
+    REASON_FPS_NOT_SUPPORT = 2;
+  }
+  .gv_pb.EnterSuperScreenRequest.EnterReason reason = 1;
+  .gv_pb.ScreenResolution resolution = 2;
+  int32 dpi_scale = 3;
+  oneof params {
+    .gv_pb.EnterSuperScreenFpsNotSupport enter_fps = 4;
+  }
+}
+
+message EnterSuperScreenResponse {
+  int32 error_code = 1;
+}

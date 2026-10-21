@@ -1,0 +1,165 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+enum enumMumuNotifyType {
+  kMumuNotifyLaunch = 0;
+  kMumuNotifyShutdown = 1;
+  kMumuNotifyRestart = 2;
+  kMumuNotifyDelete = 3;
+  kMumuNotifyCreate = 4;
+  kMumuNotifyCopy = 5;
+  kMumuNotifyPlayerCrash = 6;
+  kMumuNotifyPlayerHeadlessCrash = 7;
+}
+
+enum enumMumuErrorCode {
+  kMumuErrorCodeSuccess = 0;
+  kMumuErrorCodeFailed = 1;
+}
+
+message MumuInfo {
+  enum enumRunStatus {
+    kMumuRunStatusNotRun = 0;
+    kMumuRunStatusProcessStart = 1;
+    kMumuRunStatusCompleteCommunication = 2;
+    kMumuRunStatusAndroidComplete = 3;
+    kMumuRunStatusClosing = 4;
+    kMumuRunStatusLaunchFailed = 5;
+  }
+  int32 vm_index = 1;
+  string name = 2;
+  .gv_pb.MumuInfo.enumRunStatus run_status = 3;
+}
+
+message MumuPlayerList {
+  bool get_all = 1;
+  repeated .gv_pb.MumuInfo list_info = 2;
+  repeated int32 list_vm_index = 3;
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message LanguageValue {
+  string value = 1;
+  string language_value = 2;
+}
+
+message LanguageKeyValue {
+  string key = 1;
+  .gv_pb.LanguageValue value = 2;
+}
+
+message OneKeyMultiValue {
+  string key = 1;
+  string current_value = 2;
+  repeated .gv_pb.LanguageValue list_value = 3;
+}
+
+message Performance {
+  string value = 1;
+  string language_value = 2;
+  string cpu_core_num = 3;
+  string mem_value = 4;
+}
+
+message SettingRangePerformance {
+  string key = 1;
+  string key_custom_cpu = 2;
+  string key_custom_mem = 3;
+  string current_value = 4;
+  string current_custom_cpu = 5;
+  string current_custom_mem = 6;
+  repeated string list_range_custom_cpu = 7;
+  repeated string list_range_custom_mem = 8;
+  repeated .gv_pb.Performance list_performance = 9;
+}
+
+message MinMax {
+  int32 min = 1;
+  int32 max = 2;
+}
+
+message Resolution {
+  string value = 1;
+  string width = 2;
+  string height = 3;
+  string dpi = 4;
+}
+
+message SettingRangeResolution {
+  string key = 1;
+  string key_custom_resolution_width = 2;
+  string key_custom_resolution_height = 3;
+  string key_custom_resolution_dpi = 4;
+  string current_value = 5;
+  string current_custom_width = 6;
+  string current_custom_height = 7;
+  string current_custom_dpi = 8;
+  .gv_pb.MinMax range_resolution_width = 9;
+  .gv_pb.MinMax range_resolution_height = 10;
+  .gv_pb.MinMax range_resolution_dpi = 11;
+  repeated .gv_pb.Resolution list_resolution = 12;
+}
+
+message MumuSettingRange {
+  int32 vm_index = 1;
+  string language = 2;
+  .gv_pb.OneKeyMultiValue render_list = 3;
+  .gv_pb.SettingRangePerformance performance_list = 4;
+  .gv_pb.SettingRangeResolution resolution_list = 5;
+}
+
+message MumuSetting {
+  enum enumType {
+    kMumuSettingLocal = 0;
+    kMumuSettingGlobal = 1;
+  }
+  repeated int32 list_vm_index = 1;
+  .gv_pb.MumuSetting.enumType type = 2;
+  bool set_or_get = 3;
+  map<string, string> map_key_value = 4;
+  bool get_setting_range = 5;
+  oneof _setting_range {
+    .gv_pb.MumuSettingRange setting_range = 6;
+  }
+}
+
+message MumuControl {
+  enum enumType {
+    kMumuControlLaunch = 0;
+    kMumuControlShutdown = 1;
+    kMumuControlRestart = 2;
+    kMumuControlDelete = 3;
+    kMumuControlCreate = 4;
+    kMumuControlCopy = 5;
+  }
+  repeated int32 list_vm_index = 1;
+  .gv_pb.MumuControl.enumType type = 2;
+}
+
+message MumuNotifySimple {
+  int32 vm_index = 1;
+  .gv_pb.enumMumuNotifyType type = 2;
+  .gv_pb.enumMumuErrorCode error_code = 3;
+}
+
+message MumuNotifyProcess {
+  int32 vm_index = 1;
+  .gv_pb.enumMumuNotifyType type = 2;
+  int32 progress = 3;
+}
+
+message MumuOperate {
+  oneof which {
+    .gv_pb.MumuPlayerList player_list = 1;
+    .gv_pb.MumuControl control = 2;
+    .gv_pb.MumuSetting setting = 3;
+    .gv_pb.MumuSettingRange setting_range = 4;
+    .gv_pb.MumuNotifyProcess notify_process = 5;
+    .gv_pb.MumuNotifySimple notify_result = 6;
+  }
+}

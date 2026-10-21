@@ -1,0 +1,1 @@
+Adds WindowExtStartupNotify::activate_with_token for an existing window. Wayland uses xdg_activation_v1.activate with the desktop launcher token; X11 uses normal focus_window. Called via the eframe Frame wrapper on the GUI thread. No desktop-environment-specific commands.

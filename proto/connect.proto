@@ -1,0 +1,77 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "defines.proto";
+import "feature_flag.proto";
+
+message CaptureParams {
+  .gv_pb.FPS fps = 1;
+  .gv_pb.VideoQuality video_quality = 2;
+  bool cursor_capture = 3;
+  .gv_pb.ChooseResolutionType choose_resolution_type = 4;
+  .gv_pb.ScreenResolution local_resolution = 5;
+  .gv_pb.ScreenResolution choose_resolution = 6;
+  .gv_pb.ChromaFormat chroma_format = 7;
+  int32 max_custom_bitrate = 8;
+  bool enable_hdr = 9;
+  .gv_pb.VideoQuality auto_frame_quality = 10;
+  int32 fpsCount = 11;
+}
+
+message DecoderCap {
+  int32 fps = 1;
+  .gv_pb.CodecType codec_type = 2;
+  int32 resolution_width = 3;
+  int32 resolution_height = 4;
+  .gv_pb.ChromaFormat chroma_format = 5;
+}
+
+message VirtualDisplayMode {
+  int32 width = 1;
+  int32 height = 2;
+  int32 VSync = 3;
+}
+
+message VirtualDisplayInitResolution {
+  int32 width = 1;
+  int32 height = 2;
+}
+
+message ConnectOptions {
+  enum Type {
+    CT_UNKNOWN = 0;
+    CT_DESKTOP = 1;
+    CT_WINDOW = 2;
+    CT_MUMU = 3;
+    CT_HOOK = 4;
+    CT_FILETRANSFER = 5;
+    CT_SECOND_SCREEN = 6;
+    CT_QUICKLAUNCH = 7;
+    CT_TERMINAL = 8;
+    CT_PORTMAPPING = 9;
+  }
+  .gv_pb.ConnectOptions.Type capture_type = 1;
+  int32 type_value = 2;
+  .gv_pb.CaptureParams capture_params = 3;
+  repeated .gv_pb.DecoderCap decoder_cap_list = 4;
+  bool force_virtual_display = 5;
+  repeated .gv_pb.VirtualDisplayMode virtual_display_modes = 6;
+  .gv_pb.VirtualDisplayInitResolution virtual_display_init_resolution = 7;
+  .gv_pb.ClientType client_type = 8;
+  string device_id = 9;
+  .gv_pb.ControlConnectType control_connect_type = 10;
+  .gv_pb.FeatureFlag feature_flag = 11;
+  string client_version = 12;
+}
+
+message EncoderCap {
+  .gv_pb.CaptureMode capture_mode = 1;
+  int32 fps = 2;
+  .gv_pb.CodecType corec_type = 3;
+  int32 resolution_width = 4;
+  int32 resolution_height = 5;
+}
+
+message CodecNegotiation {
+  repeated .gv_pb.EncoderCap encoder_cap_list = 1;
+}

@@ -1,0 +1,31 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+message TouchEventPoint {
+  uint32 id = 1;
+  float x = 2;
+  float y = 3;
+  float radius_x = 4;
+  float radius_y = 5;
+  float angle = 6;
+  float pressure = 7;
+}
+
+message TouchEvent {
+  enum TouchEventType {
+    TOUCH_POINT_UNDEFINED = 0;
+    TOUCH_POINT_START = 1;
+    TOUCH_POINT_MOVE = 2;
+    TOUCH_POINT_END = 3;
+    TOUCH_POINT_CANCEL = 4;
+  }
+  .gv_pb.TouchEvent.TouchEventType event_type = 1;
+  repeated .gv_pb.TouchEventPoint touch_points = 2;
+}
+
+message InputEvent {
+  oneof which {
+    .gv_pb.TouchEvent touch_event = 1;
+  }
+}

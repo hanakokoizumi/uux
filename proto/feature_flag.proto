@@ -1,0 +1,86 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+
+enum FF_CaptureSetting {
+  FF_CAPTURE_SETTING_UNKNOWN = 0;
+  FF_CAPTURE_SETTING_INIT_VERION = 1;
+  FF_CAPTURE_SETTING_AUTO_CREATE_VIRTUAL_DISPLAY = 2;
+  FF_CAPTURE_SETTING_CHROMA_SAMPLING = 3;
+  FF_CAPTURE_SETTING_CUSTOM_BITRATE = 4;
+  FF_CAPTURE_SETTING_DPI_SCALE = 5;
+  FF_CAPTURE_SETTING_HDR = 6;
+}
+
+enum FF_SimpleAction {
+  FF_SIMPLE_ACTION_UNKNOWN = 0;
+  FF_SIMPLE_ACTION_MUTING = 1;
+  FF_SIMPLE_ACTION_AUTO_LOCK = 2;
+  FF_SIMPLE_ACTION_STOP_STREAMING = 3;
+}
+
+enum FF_SystemMetrics {
+  FF_SYSTEM_METRICS_UNKNOWN = 0;
+  FF_SYSTEM_METRICS_SETTING = 1;
+  FF_SYSTEM_METRICS_SETTING_AUTO_LOCK = 2;
+  FF_SYSTEM_METRICS_SETTING_PRIVATE_SCREEN = 3;
+}
+
+enum FF_PrivateScreenSetting {
+  FF_PRIVATE_SCREEN_SETTING_UNKNOWN = 0;
+  FF_PRIVATE_SCREEN_SETTING_INIT_VERION = 1;
+  FF_PRIVATE_SCREEN_ENHANCED_PRIVACY = 2;
+}
+
+enum FF_UpdateAcquire {
+  FF_UPDATE_ACQUIRE_UNKNOWN = 0;
+  FF_UPDATE_ACQUIRE_INIT_VERION = 1;
+}
+
+enum FF_FileTransfer_FTP {
+  FF_FILE_TRANSFER_FTP_UNKNOWN = 0;
+  FF_FILE_TRANSFER_FTP_INIT_VERION = 1;
+  FF_FILE_TRANSFER_FTP_LIST_COMPRESS = 2;
+}
+
+enum FF_FileTransfer_FTP2 {
+  FF_FILE_TRANSFER_FTP2_UNKNOWN = 0;
+  FF_FILE_TRANSFER_FTP2_RESUMABLE = 1;
+  FF_FILE_TRANSFER_FTP2_SPEEDY = 2;
+}
+
+enum FF_Clipboard {
+  FF_CLIPBOARD_UNKNOWN = 0;
+  FF_CLIPBOARD_INIT_VERION = 1;
+  FF_CLIPBOARD_SUPPORT_FILE = 2;
+  FF_CLIPBOARD_SUPPORT_TEXT_CHANGE = 3;
+}
+
+enum FF_Qos_Stat {
+  FF_QOS_STAT_UNKNOWN = 0;
+  FF_QOS_STAT_INIT_VERION = 1;
+}
+
+enum MuMu_Control {
+  FF_MUMU_CONTROL_UNKNOWN = 0;
+  FF_MUMU_CONTROL_INIT_VERION = 1;
+}
+
+enum Virtual_Mouse_Device {
+  FF_VIRTUAL_MOUSE_DEVICE_UNKNOWN = 0;
+  FF_VIRTUAL_MOUSE_DEVICE_INIT_VERION = 1;
+}
+
+message FeatureFlag {
+  int32 ff_capture_setting = 1;
+  int32 ff_simple_action = 2;
+  int32 ff_system_metrics = 3;
+  int32 ff_private_screen = 4;
+  int32 ff_update_acquire = 5;
+  int32 ff_file_transfer_ftp = 6;
+  int32 ff_file_transfer_ftp2 = 7;
+  int32 ff_clipboard = 8;
+  int32 ff_qos_stat = 9;
+  int32 ff_mumu_control = 10;
+  int32 ff_virtual_mouse_device = 11;
+}

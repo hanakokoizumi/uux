@@ -1,0 +1,74 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "rpc_message.proto";
+import "rpc_file_transfer.proto";
+import "clipboard.proto";
+
+message RequestHeader {
+  int64 request_id = 1;
+}
+
+message ResponseHeader {
+  int64 request_id = 1;
+}
+
+message RpcRequest {
+  .gv_pb.RequestHeader request_header = 1;
+  oneof which {
+    .gv_pb.CaptureSettingRequest capture_setting = 2;
+    .gv_pb.FpsSettingRequest fps_setting = 3;
+    .gv_pb.VideoQualitySettingReqeust video_quality_setting = 4;
+    .gv_pb.CursorSettingReqeust cursor_setting = 5;
+    .gv_pb.ResolutionSettingRequest resolution_setting = 6;
+    .gv_pb.PrivateScreenSettingRequest private_screen_setting = 7;
+    .gv_pb.FileTransferFtpRequest file_transfer_ftp_request = 8;
+    .gv_pb.ClipboardRequest clip_request = 9;
+    .gv_pb.ClipboardTextChangeRequest text_change_request = 10;
+    .gv_pb.VirtualMouseSwitchRequest mouse_switch_request = 11;
+    .gv_pb.CreateVirtualDisplayRequest create_virtual_display_req = 12;
+    .gv_pb.RemoveVirtualDisplayRequest remove_virtual_display_req = 13;
+    .gv_pb.QuitSuperScreenRequest quit_super_screen = 14;
+    .gv_pb.SendVideoTrackRequest send_video_track_req = 15;
+    .gv_pb.QueryPluginSettingRequest query_plugin_setting_req = 16;
+    .gv_pb.UpdatePluginSettingRequest update_plugin_setting_req = 17;
+    .gv_pb.StartDownloadAndInstallPluginRequest start_download_and_install_plugin_req = 18;
+    .gv_pb.PluginEnableNotificationRequest plugin_enable_notification_req = 19;
+    .gv_pb.PluginNotificationRequest plugin_notification_req = 20;
+    .gv_pb.VirtualAudioDriverPolicyRequest virtual_audio_driver_policy_req = 21;
+    .gv_pb.SendFlipScreenRequest flip_screen_req = 22;
+    .gv_pb.QuickLaunchScanRequest quick_launch_scan_req = 23;
+    .gv_pb.QuickLaunchAppIconRequest quick_launch_app_icon_req = 24;
+    .gv_pb.UpdateScreenSaverRequest update_screen_saver_req = 25;
+    .gv_pb.EnterSuperScreenRequest enter_super_screen_req = 26;
+    .gv_pb.CheckEnvReq terminal_check_env_req = 28;
+  }
+}
+
+message RpcResponse {
+  .gv_pb.ResponseHeader response_header = 1;
+  oneof which {
+    .gv_pb.CaptureSettingResponse capture_setting = 2;
+    .gv_pb.PrivateScreenSettingResponse private_screen_setting = 3;
+    .gv_pb.FileTransferFtpResponse file_transfer_ftp_response = 4;
+    .gv_pb.ClipboardResponse clip_response = 5;
+    .gv_pb.ClipboardTextChangeResponse text_change_response = 6;
+    .gv_pb.VirtualMouseSwitchResponse mouse_switch_response = 7;
+    .gv_pb.CreateVirtualDisplayResponse create_virtual_display_rsp = 8;
+    .gv_pb.RemoveVirtualDisplayResponse remove_virtual_display_rsp = 9;
+    .gv_pb.QuitSuperScreenResponse quit_super_screen = 10;
+    .gv_pb.SendVideoTrackResponse send_video_track_rsp = 11;
+    .gv_pb.QueryPluginSettingResponse query_plugin_setting_rsp = 12;
+    .gv_pb.UpdatePluginSettingResponse update_plugin_setting_rsp = 13;
+    .gv_pb.StartDownloadAndInstallPluginResponse start_download_and_install_plugin_rsp = 14;
+    .gv_pb.PluginEnableNotificationResponse plugin_enable_notification_rsp = 15;
+    .gv_pb.PluginNotificationResponse plugin_notification_rsp = 16;
+    .gv_pb.VirtualAudioDriverPolicyResponse virtual_audio_driver_policy_rsp = 17;
+    .gv_pb.SendFlipScreenResponse flip_screen_rsp = 18;
+    .gv_pb.QuickLaunchScanResponse quick_launch_scan_rsp = 19;
+    .gv_pb.QuickLaunchAppIconResponse quick_launch_app_icon_rsp = 20;
+    .gv_pb.UpdateScreenSaverResponse update_screen_saver_rsp = 21;
+    .gv_pb.EnterSuperScreenResponse enter_super_screen_rep = 22;
+    .gv_pb.CheckEnvResp terminal_check_env_resp = 24;
+  }
+}

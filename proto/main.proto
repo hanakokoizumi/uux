@@ -1,0 +1,42 @@
+// Reconstructed from embedded descriptors. Wire schema only.
+syntax = "proto3";
+package gv_pb;
+import "general.proto";
+import "mumu.proto";
+import "notification.proto";
+import "connect.proto";
+import "input_event.proto";
+import "rpc_main.proto";
+import "port_mapping.proto";
+
+message Message {
+  int64 seq = 1;
+  int64 timestamp = 2;
+  oneof which {
+    .gv_pb.SimpleAction simple_action = 3;
+    .gv_pb.LaunchApp launch_app = 4;
+    .gv_pb.ShowApp show_app = 5;
+    .gv_pb.MumuOperate mumu_operate = 6;
+    .gv_pb.ScreenSources screens = 7;
+    .gv_pb.CaptureChange capture_change = 8;
+    .gv_pb.CaptureConfig capture_config = 9;
+    .gv_pb.RomMessage rom_message = 10;
+    .gv_pb.SendToRom send_to_rom = 11;
+    .gv_pb.ReportError report_error = 12;
+    .gv_pb.SystemMetrics system_metrics = 13;
+    .gv_pb.ReportQosStats report_qos_stats = 14;
+    .gv_pb.SystemStateChange system_state_change = 15;
+    .gv_pb.QuerySystemState query_system_state = 16;
+    .gv_pb.ClipboardChange clipboard_change = 17;
+    .gv_pb.CodecNegotiation codec_negotiation = 18;
+    .gv_pb.CaptureConfigResponse capture_config_response = 19;
+    .gv_pb.InputEvent input_event = 20;
+    .gv_pb.RpcRequest rpc_request = 21;
+    .gv_pb.RpcResponse rpc_response = 22;
+    .gv_pb.ActiveWindowChange active_window_change = 23;
+    .gv_pb.LaunchCloudPcApp launch_cloud_pc_app = 24;
+    .gv_pb.CaptureSettingSync capture_setting_sync = 25;
+    .gv_pb.RemoteDownloadPath remote_download_path = 26;
+    .gv_pb.PortMappingFrame port_mapping_frame = 27;
+  }
+}
