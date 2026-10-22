@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=UUX
+Comment=Remote desktop client for UU
+Comment[zh_CN]=UU 远程主控端
+Exec=uux
+Icon=uux
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=uux

@@ -1,1 +1,6 @@
 /target/
+/dist/
+/.ci-cache/
+/result
+/result-*
+/ci/__pycache__/

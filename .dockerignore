@@ -1,0 +1,4 @@
+**
+!ci/
+!ci/linux.Dockerfile
+!ci/build-media.sh

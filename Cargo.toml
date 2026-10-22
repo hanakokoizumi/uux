@@ -7,7 +7,7 @@ description = "UUX — Linux-native remote desktop client for UU, built with Rus
 
 [workspace]
 members = ["vendor/webrtc-sctp", "vendor/webrtc-util"]
-exclude = ["vendor/eframe"]
+exclude = ["vendor/eframe", "vendor/ffmpeg-sys-next"]
 default-members = ["."]
 resolver = "3"
 
@@ -37,7 +37,7 @@ prost = "0.14"
 bytes = "1"
 flate2 = "1"
 webrtc = "0.17"
-ffmpeg-next = "9"
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "filter", "software-scaling"] }
 cpal = "0.17"
 opus = "0.3"
 arboard = { version = "3", features = ["wayland-data-control"] }
@@ -58,6 +58,8 @@ lto = "thin"
 strip = true
 
 [patch.crates-io]
+# The upstream Vulkan shim assumes a 64-bit pointer ABI; retain correct i386 layout.
+ffmpeg-sys-next = { path = "vendor/ffmpeg-sys-next" }
 # Keep hidden immediate viewports off the presentation path; see UU-PATCH.md.
 eframe = { path = "vendor/eframe" }
 # Scoped transport timing/framing patches; see vendor/webrtc-sctp/UU-PATCH.md.

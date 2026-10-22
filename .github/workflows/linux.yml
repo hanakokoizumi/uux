@@ -1,0 +1,273 @@
+name: Linux checks, packages and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  check:
+    name: Workflow and release checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash ci/lint.sh
+      - id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          args=()
+          if [[ "$REF_TYPE" == tag ]]; then args+=(--tag "$REF_NAME"); fi
+          version=$(python3 ci/release-files.py "${args[@]}")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.arch }} · test, build, package
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            docker_arch: amd64
+            runner: ubuntu-24.04
+            checks: '1'
+          - arch: i386
+            platform: linux/386
+            docker_arch: '386'
+            runner: ubuntu-24.04
+            checks: '0'
+          - arch: aarch64
+            platform: linux/arm64
+            docker_arch: arm64
+            runner: ubuntu-24.04-arm
+            checks: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ci/linux.Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: TARGETARCH=${{ matrix.docker_arch }}
+          load: true
+          tags: uux-builder:${{ matrix.arch }}
+          cache-from: type=gha,scope=uux-media-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=uux-media-${{ matrix.arch }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci-cache/cargo-${{ matrix.arch }}
+            target/ci/${{ matrix.arch }}
+          key: linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'ci/linux.Dockerfile', 'ci/build-media.sh') }}-${{ github.sha }}
+          restore-keys: |
+            linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'ci/linux.Dockerfile', 'ci/build-media.sh') }}-
+      - name: Rust checks, native build and GUI smoke test
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          RUN_CHECKS: ${{ matrix.checks }}
+        run: |
+          docker run --rm --platform "$PLATFORM" \
+            --user "$(id -u):$(id -g)" -v "$PWD:/work" \
+            -e RUN_CHECKS "uux-builder:$ARCH" \
+            bash ci/build-linux.sh "$ARCH"
+      - name: Create deb, rpm, pacman and binary archives
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          bash ci/install-nfpm.sh "$RUNNER_TEMP/uux-tools"
+          export PATH="$RUNNER_TEMP/uux-tools:$PATH"
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct)
+          python3 ci/package-linux.py --arch "$ARCH" --bundle "dist/bundle-$ARCH"
+      - name: Verify Debian package in a clean runtime container
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          docker run --rm --platform "$PLATFORM" -v "$PWD/dist/packages:/packages:ro" \
+            -e ARCH -e VERSION \
+            debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 \
+            sh -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends /packages/uux-$VERSION-linux-$ARCH.deb xvfb xauth libgl1-mesa-dri
+              uux --help
+              timeout 30 xvfb-run -a uux --state-dir /tmp/uux-state --screenshot /tmp/uux.png --quit-after 3
+              test -s /tmp/uux.png
+            '
+      - name: Include the exact media sources
+        if: matrix.arch == 'amd64'
+        run: |
+          docker run --rm uux-builder:amd64 cat /opt/uux-media/share/ffmpeg-source.tar.xz \
+            > dist/packages/ffmpeg-9.0.2-source.tar.xz
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+          retention-days: 14
+
+  package-smoke:
+    name: Install ${{ matrix.arch }} ${{ matrix.format }} package
+    needs: [check, linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - format: rpm
+            arch: amd64
+            runner: ubuntu-24.04
+            image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+          - format: rpm
+            arch: i386
+            runner: ubuntu-24.04
+            image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+          - format: rpm
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+          - format: archlinux
+            arch: amd64
+            runner: ubuntu-24.04
+            image: archlinux:base@sha256:52dfbd5afb23a220d5ee92dafcb4c788d96c026ed04179890c23adef4c897fa0
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: packages
+      - env:
+          FORMAT: ${{ matrix.format }}
+          ARCH: ${{ matrix.arch }}
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          docker run --rm -v "$PWD/packages:/packages:ro" -e FORMAT -e ARCH -e VERSION "$IMAGE" sh -ec '
+            case "$FORMAT" in
+              rpm) dnf --disablerepo=updates --disablerepo=fedora-cisco-openh264 \
+                     install -y /packages/uux-$VERSION-linux-$ARCH.rpm ;;
+              archlinux) pacman -Syu --noconfirm
+                         pacman -U --noconfirm /packages/uux-$VERSION-linux-$ARCH.pkg.tar.zst ;;
+              *) exit 1 ;;
+            esac
+            uux --help
+          '
+
+  nix:
+    name: Nix ${{ matrix.arch }} · build and export closure
+    needs: [check, linux]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: i386
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            extra-platforms = ${{ matrix.arch == 'aarch64' && 'aarch64-linux' || 'i686-linux' }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: linux-${{ matrix.arch }}
+          path: incoming
+      - name: Check flake and build Nix release package
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          nix flake check --no-build
+          mkdir -p dist
+          tar -xzf "incoming/uux-$VERSION-linux-$ARCH.tar.gz" -C dist
+          bash ci/package-nix.sh "$ARCH" "./dist/uux-$VERSION-linux-$ARCH"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nix-${{ matrix.arch }}
+          path: dist/packages/*.nix.tar.xz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Verify complete matrix and publish release
+    needs: [check, linux, package-smoke, nix]
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: linux-*
+          merge-multiple: true
+          path: release-assets
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: nix-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify assets and checksums
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          git archive --format=tar.gz --prefix="uux-$VERSION/" HEAD \
+            > "release-assets/uux-$VERSION-source.tar.gz"
+          python3 ci/release-files.py --tag "$TAG" --directory release-assets
+          (cd release-assets && sha256sum --check SHA256SUMS)
+      - name: Publish only after every required asset is present
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --json isDraft --jq .isDraft > "$RUNNER_TEMP/uux-draft"; then
+            if [[ $(cat "$RUNNER_TEMP/uux-draft") != true ]]; then
+              echo 'A published release already exists; refusing to replace its assets.' >&2
+              exit 1
+            fi
+          else
+            args=()
+            if [[ "$TAG" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$TAG" --verify-tag --draft --generate-notes \
+              --title "UUX $TAG" "${args[@]}"
+          fi
+          gh release upload "$TAG" release-assets/* --clobber
+          gh release edit "$TAG" --draft=false
