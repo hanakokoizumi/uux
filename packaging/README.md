@@ -13,7 +13,7 @@ Windows、macOS 尚未移植，本轮不发布对应产物。i386、aarch64 的 
 ## 触发
 
 - PR、`main` 更新、手动运行：检查、三架构构建、测试、打包，结果保留为 Actions artifacts。
-- 推送与 `Cargo.toml` 版本一致的标签（如 `v0.2.0`）：全部成功后自动发布 GitHub Release。
+- 推送与 `Cargo.toml` 版本一致的标签（如 `v0.2.1`）：全部成功后自动发布 GitHub Release。
 - 发布必须包含 15 个架构产物、UUX 源码、FFmpeg 源码及 `SHA256SUMS`。先上传草稿再发布；失败不会发布缺少产物的版本。已发布版本不会被覆盖。
 
 检查包含格式、Clippy、Rust 单元测试、工作流校验、打包测试、X11 GUI 启动及全新 Debian / Fedora / Arch 容器安装。不会登录账号或连接远端设备。
