@@ -131,6 +131,8 @@ pub(super) struct UiState {
     path: PathBuf,
     page: Page,
     pub windows: SessionWindows,
+    session_ready: bool,
+    pub(super) remote_disconnected: bool,
     remote_resize: window_resize::ResizeGrip,
     root_resize: window_resize::ResizeGrip,
     file_resize: window_resize::ResizeGrip,
@@ -183,6 +185,7 @@ pub(super) struct UiState {
     directory_request: i64,
     add_help: bool,
     about_open: bool,
+    icon_gallery_open: bool,
     assist_id: String,
     assist_code: String,
     active_assist: Option<String>,
@@ -252,6 +255,8 @@ impl UiState {
             path,
             page: Page::All,
             windows: SessionWindows::default(),
+            session_ready: false,
+            remote_disconnected: false,
             remote_resize: Default::default(),
             root_resize: Default::default(),
             file_resize: Default::default(),
@@ -302,6 +307,7 @@ impl UiState {
             directory_request: 100,
             add_help: false,
             about_open: false,
+            icon_gallery_open: false,
             assist_id: String::new(),
             assist_code: String::new(),
             active_assist: None,
@@ -328,7 +334,16 @@ impl UiState {
     pub(super) fn select_device_page(&mut self) {
         self.page = Page::Device;
     }
-    pub(super) fn end_session(&mut self) {
+    pub(super) fn begin_session(&mut self) {
+        self.session_ready = false;
+        self.remote_disconnected = false;
+    }
+    pub(super) fn end_session(&mut self, local: bool) {
+        // Error can precede Disconnected. Keep the notice until acknowledged,
+        // including when repeated terminal events arrive for the same session.
+        self.remote_disconnected =
+            !local && (self.remote_disconnected || self.session_ready && self.windows.remote);
+        self.session_ready = false;
         self.windows.ports = false;
         self.ports = Default::default();
         self.windows.terminal = false;
@@ -346,8 +361,9 @@ impl UiState {
         if self.active_assist.take().is_some() {
             self.page = Page::Assistance;
         }
-        self.windows.remote = false;
+        self.windows.remote = self.remote_disconnected;
         self.windows.files = false;
+        self.windows.clipboard_active = false;
         self.text_window = false;
         self.custom_bitrate_mbps = None;
         self.file_dialog = None;
@@ -398,6 +414,7 @@ impl UiState {
         }
     }
     pub(super) fn connected(&mut self) {
+        self.session_ready = true;
         if let Some(id) = &self.active_assist {
             self.prefs.assist_history.retain(|old| old != id);
             self.prefs.assist_history.insert(0, id.clone());
@@ -505,6 +522,32 @@ fn modal_cancel(ui: &mut egui::Ui, label: &str) -> bool {
         })
         .inner
 }
+fn disconnected_dialog(ctx: &egui::Context) -> bool {
+    modal(ctx, "remote-disconnected", |ui| {
+        modal_body(ui, "连接已断开", |ui| {
+            ui.label("对端已断开连接，远控已结束。");
+        });
+        egui::Frame::new()
+            .fill(BG)
+            .inner_margin(24)
+            .corner_radius(egui::CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: 8,
+                se: 8,
+            })
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    art::primary(ui, "退出远控", Vec2::new(195.0, 32.0)).clicked()
+                })
+                .inner
+            })
+            .inner
+    })
+    .inner
+    // Escape and backdrop clicks intentionally do not dismiss this notice.
+}
+
 fn windows_icon(p: &egui::Painter, r: egui::Rect, online: bool) {
     p.rect_filled(
         r,
@@ -816,12 +859,26 @@ impl Desktop {
     /// dialog must never submit its action or change remote state.
     pub(in crate::app) fn diagnostic_dialog(&mut self, name: &str) -> Option<egui::ViewportId> {
         match name {
+            "icons" => {
+                self.ui_state.icon_gallery_open = true;
+                Some(egui::ViewportId::ROOT)
+            }
+            "about" => {
+                self.ui_state.about_open = true;
+                Some(egui::ViewportId::ROOT)
+            }
             "files" if !self.connected && !self.connecting => {
                 self.ui_state.windows.files = true;
                 Some(self.viewport("files"))
             }
             "remote" if !self.connected && !self.connecting => {
                 self.show_remote_window();
+                Some(self.viewport("remote"))
+            }
+            "disconnected" if !self.connected && !self.connecting => {
+                self.show_remote_window();
+                self.ui_state.connected();
+                self.finish_session();
                 Some(self.viewport("remote"))
             }
             "terminal" if !self.connected && !self.connecting => {
@@ -1239,12 +1296,20 @@ impl Desktop {
                             );
                         });
                     });
+                    ui.hyperlink_to(
+                        "GitHub · hanakokoizumi/uux",
+                        "https://github.com/hanakokoizumi/uux",
+                    )
+                    .on_hover_text("在浏览器中打开项目仓库");
                 });
                 modal_cancel(ui, "关闭")
             });
             if response.inner || response.should_close() {
                 self.ui_state.about_open = false;
             }
+        }
+        if self.options.diagnostic_stdin && self.ui_state.icon_gallery_open {
+            art::gallery(&ctx, &mut self.ui_state.icon_gallery_open);
         }
         self.error_dialog(&ctx);
         self.assistance_dialog(&ctx);
@@ -1272,6 +1337,12 @@ impl Desktop {
         }
     }
     fn remote_dialogs(&mut self, ctx: &egui::Context) {
+        if self.ui_state.remote_disconnected {
+            if disconnected_dialog(ctx) {
+                self.close_remote_window();
+            }
+            return;
+        }
         self.error_dialog(ctx);
         if let Some(enter) = self.ui_state.super_confirm {
             self.release();
@@ -1848,6 +1919,7 @@ impl Desktop {
         }
         self.release();
         self.error = None;
+        self.ui_state.begin_session();
         self.generation += 1;
         if !self.send(json!({"op":"connect","assist_id":id,"assist_code":code,"generation":self.generation,"settings":self.ui_state.settings_for_device(&format!("assist:{id}"))})){return;}
         self.active_device = Some(Device {
@@ -2195,7 +2267,11 @@ impl Desktop {
                                     });
                                 }
                                 if screens.is_empty() {
-                                    ui.label("正在获取屏幕…");
+                                    ui.label(if self.ui_state.remote_disconnected {
+                                        "连接已断开"
+                                    } else {
+                                        "正在获取屏幕…"
+                                    });
                                 }
                             });
                         });
@@ -2936,7 +3012,7 @@ mod screen_preference_tests {
         ui.observe_screen_choice(Some("a"), "ready", true);
         ui.screen_choice_pending = Some(false);
         ui.observe_screen_choice(Some("b"), "ready", false);
-        ui.end_session();
+        ui.end_session(true);
         ui.observe_screen_choice(Some("a"), "ready", false);
         let restored = UiState::load(Some(dir.path().to_owned()));
         assert_eq!(restored.settings_for_device("a")["super_screen"], true);
@@ -2947,6 +3023,91 @@ mod screen_preference_tests {
                 .get("super_screen")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod disconnect_notice_tests {
+    use super::*;
+
+    #[test]
+    fn remote_end_keeps_only_the_affected_view_and_survives_duplicate_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ui = UiState::load(Some(directory.path().into()));
+        ui.windows.remote = true;
+        ui.windows.files = true;
+        ui.windows.terminal = true;
+        ui.windows.ports = true;
+        ui.connected();
+        ui.end_session(false);
+        assert!(ui.remote_disconnected && ui.windows.remote);
+        assert!(!ui.can_retire());
+        assert!(!ui.windows.files && !ui.windows.terminal && !ui.windows.ports);
+        ui.end_session(false);
+        assert!(ui.remote_disconnected && ui.windows.remote);
+        ui.begin_session();
+        assert!(!ui.remote_disconnected);
+    }
+
+    #[test]
+    fn local_close_failed_start_and_file_only_sessions_do_not_raise_remote_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        for (ready, remote, local) in [
+            (true, true, true),
+            (false, true, false),
+            (true, false, false),
+        ] {
+            let mut ui = UiState::load(Some(directory.path().into()));
+            ui.windows.remote = remote;
+            ui.windows.files = !remote;
+            if ready {
+                ui.connected();
+            }
+            ui.end_session(local);
+            assert!(!ui.remote_disconnected && !ui.windows.remote);
+            assert!(ui.can_retire());
+        }
+    }
+
+    #[test]
+    fn another_devices_state_is_not_changed_by_a_remote_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut first = UiState::load(Some(directory.path().into()));
+        let mut second = UiState::load(Some(directory.path().into()));
+        for ui in [&mut first, &mut second] {
+            ui.windows.remote = true;
+            ui.connected();
+        }
+        first.end_session(false);
+        assert!(second.session_ready && second.windows.remote && !second.remote_disconnected);
+    }
+
+    #[test]
+    fn escape_cannot_dismiss_the_remote_end_dialog() {
+        let ctx = egui::Context::default();
+        super::super::setup(&ctx);
+        for pressed in [false, true, false] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(920.0, 680.0),
+                    )),
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    ..Default::default()
+                },
+                |ui| {
+                    assert!(!disconnected_dialog(ui.ctx()));
+                },
+            );
+            output.textures_delta.clear();
+        }
     }
 }
 

@@ -32,7 +32,7 @@ impl Desktop {
         self.raise_window(self.viewport("remote"));
     }
 
-    pub(super) fn raise_window(&self, target: egui::ViewportId) {
+    pub(in crate::app) fn raise_window(&self, target: egui::ViewportId) {
         for command in [
             egui::ViewportCommand::Visible(true),
             egui::ViewportCommand::Minimized(false),
@@ -67,6 +67,10 @@ impl Desktop {
         self.control(json!({"op":"clipboard_focus","enabled":false}));
         self.ui_state.windows.clipboard_active = false;
         self.ui_state.windows.remote = false;
+        self.ui_state.remote_disconnected = false;
+        if !self.connected && !self.connecting {
+            self.active_device = None;
+        }
         self.ui_state.text_window = false;
         self.ui_state.remote_action = None;
         self.ui_state.super_confirm = None;
@@ -113,6 +117,7 @@ impl Desktop {
                     self.ui_state.resize_captured = self.ui_state.remote_resize.intercept(
                         ui.ctx(),
                         self.error.is_none()
+                            && !self.ui_state.remote_disconnected
                             && !self.ui_state.text_window
                             && self.ui_state.remote_action.is_none()
                             && self.ui_state.super_confirm.is_none()
@@ -224,6 +229,11 @@ impl Desktop {
     }
 
     fn remote_events(&mut self, ctx: &egui::Context) {
+        if !self.connected {
+            self.pending_input.clear();
+            self.remote_input.suspend();
+            return;
+        }
         let clipboard_active =
             self.connected && ctx.input(|i| i.focused) && self.ui_state.prefs.clipboard;
         if clipboard_active != self.ui_state.windows.clipboard_active {

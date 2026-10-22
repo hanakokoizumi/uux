@@ -2242,7 +2242,7 @@ impl Session {
             let geometry: crate::media_bus::Geometry = serde_json::from_value(binding.clone())?;
             if geometry != self.output.media.geometry() {
                 self.release_inputs().await;
-                bail!("屏幕或画面版本已变化，旧坐标已拒绝");
+                bail!(crate::media_bus::STALE_GEOMETRY);
             }
         }
         let op = command["op"].as_str().unwrap_or("");

@@ -152,6 +152,7 @@ pub struct Hub {
     pub account_events: Journal,
     pub account_state: Value,
     pub devices: Value,
+    device_refresh: crate::device_refresh::DeviceRefresh,
     pub login: Value,
     pub sessions: HashMap<String, Managed>,
     pub clients: HashMap<String, Subscriber>,
@@ -177,6 +178,7 @@ impl Hub {
             account_events: Default::default(),
             account_state: json!({"logged_in":false}),
             devices: json!([]),
+            device_refresh: Default::default(),
             login: Value::Null,
             sessions: HashMap::new(),
             clients: HashMap::new(),
@@ -517,7 +519,13 @@ impl Hub {
             let value = serde_json::to_value(&event).unwrap_or(Value::Null);
             match &event {
                 Event::State { .. } => self.account_state = value.clone(),
-                Event::Devices { devices } => self.devices = json!(devices),
+                Event::Devices { devices } => {
+                    self.devices = json!(devices);
+                    self.device_refresh.completed(Instant::now(), true);
+                }
+                Event::Error { scope, .. } if scope == "devices" => {
+                    self.device_refresh.completed(Instant::now(), false);
+                }
                 Event::Qr { .. } | Event::LoginStatus { .. } | Event::LoginComplete { .. } => {
                     if self.login.is_null() {
                         self.login = json!({});
@@ -530,6 +538,13 @@ impl Hub {
                 _ => {}
             }
             self.account_events.push(value);
+        }
+        if self.device_refresh.due(
+            Instant::now(),
+            self.account_state["logged_in"] == true && !self.clients.is_empty(),
+        ) && self.account.send(json!({"op":"devices"})).is_err()
+        {
+            self.device_refresh.completed(Instant::now(), false);
         }
         for s in self.sessions.values_mut() {
             for event in s.backend.events.try_iter() {

@@ -183,8 +183,9 @@ pub async fn run(cloud: Cloud, output: Output, mut commands: mpsc::Receiver<Valu
                 }));
             }
             "devices" => {
-                if let Some(task) = refresh.take() {
-                    task.abort();
+                if refresh.as_ref().is_some_and(|task| !task.is_finished()) {
+                    // GUI, automatic polling and MCP share the pending result.
+                    continue;
                 }
                 let cloud = cloud.clone();
                 let output = output.clone();

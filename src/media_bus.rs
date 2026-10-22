@@ -11,6 +11,7 @@ use std::{
 };
 
 const MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const STALE_GEOMETRY: &str = "屏幕或画面版本已变化，旧坐标已拒绝";
 const MAX_AGE: Duration = Duration::from_secs(3);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Geometry {

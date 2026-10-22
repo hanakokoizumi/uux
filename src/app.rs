@@ -261,10 +261,8 @@ impl Desktop {
                 // input. A dropped key-up must not leave control active.
                 self.remote_input.release();
                 self.backend = None;
-                self.connected = false;
-                self.connecting = false;
+                self.finish_session();
                 self.refreshing = false;
-                self.texture = None;
                 self.status = "原生核心通信已停止，请重新打开应用".into();
                 false
             }
@@ -349,6 +347,7 @@ impl Desktop {
             self.qr = None;
         }
         self.error = None;
+        self.ui_state.begin_session();
         self.generation += 1;
         let mut settings = self.ui_state.settings_for_device(&device.id);
         settings["wait_for_video"] = json!(wait_for_video);
@@ -379,6 +378,30 @@ impl Desktop {
         self.phase = "正在结束远控".into();
         self.connected = false;
         self.status = "正在释放远端会话".into();
+    }
+
+    fn finish_session(&mut self) {
+        let had_notice = self.ui_state.remote_disconnected;
+        self.release();
+        self.pending_input.clear();
+        self.connected = false;
+        self.connecting = false;
+        self.video_wait_requested = false;
+        self.texture = None;
+        self.frame_geometry = None;
+        self.dimensions = [0, 0];
+        self.status = "已断开连接".into();
+        self.phase.clear();
+        self.ui_state.end_session(self.disconnecting);
+        self.disconnecting = false;
+        if self.ui_state.remote_disconnected {
+            self.error = None;
+            if !had_notice {
+                self.raise_window(self.viewport("remote"));
+            }
+        } else {
+            self.active_device = None;
+        }
     }
 
     fn receive(&mut self, ctx: &egui::Context) {
@@ -449,6 +472,23 @@ impl Desktop {
                             .cloned();
                         self.prepare_tool_preview();
                     }
+                    if let Some(selected) = &self.selected {
+                        self.selected = devices.iter().find(|d| d.id == selected.id).cloned();
+                    }
+                    if let Some(active) = &self.active_device
+                        && let Some(updated) = devices.iter().find(|d| d.id == active.id)
+                    {
+                        self.active_device = Some(updated.clone());
+                    }
+                    self.previews.retain(|id, _| {
+                        devices.iter().any(|new| {
+                            &new.id == id
+                                && self
+                                    .devices
+                                    .iter()
+                                    .any(|old| old.id == new.id && old.wallpaper == new.wallpaper)
+                        })
+                    });
                     self.devices = devices;
                     if let Some(device) = self.selected.clone() {
                         self.preview(&device);
@@ -546,14 +586,7 @@ impl Desktop {
                     self.status = "已连接".into();
                 }
                 Event::Disconnected { generation } if generation == self.generation => {
-                    self.release();
-                    self.connected = false;
-                    self.connecting = false;
-                    self.texture = None;
-                    self.status = "已断开连接".into();
-                    self.ui_state.end_session();
-                    self.disconnecting = false;
-                    self.active_device = None;
+                    self.finish_session();
                 }
                 Event::Error {
                     scope,
@@ -566,17 +599,18 @@ impl Desktop {
                     {
                         continue;
                     }
+                    if scope == "operation" && message == crate::media_bus::STALE_GEOMETRY {
+                        continue;
+                    }
                     if self.options.window_test.is_some() {
                         eprintln!("窗口测试错误（{scope}）：{message}");
                     }
+                    let show_error = scope != "devices" || self.refreshing;
                     if scope == "devices" {
                         self.refreshing = false;
                     }
                     if scope == "connection" || scope == "bridge" {
-                        self.release();
-                        self.connected = false;
-                        self.connecting = false;
-                        self.texture = None;
+                        self.finish_session();
                     }
                     if scope == "bridge" {
                         self.backend = None;
@@ -587,7 +621,9 @@ impl Desktop {
                         self.qr = None;
                         self.login_status = "请刷新二维码重试".into();
                     }
-                    self.error = Some(message);
+                    if show_error && !self.ui_state.remote_disconnected {
+                        self.error = Some(message);
+                    }
                 }
                 _ => {}
             }
@@ -905,6 +941,11 @@ impl eframe::App for Desktop {
                     frame.request_activation_token();
                 }
                 Some("ui_state") => {
+                    let open = match command["target"].as_str() {
+                        Some("remote") => self.ui_state.windows.remote,
+                        Some("files") => self.ui_state.windows.files,
+                        _ => true,
+                    };
                     let target = match command["target"].as_str() {
                         Some("remote") => self.viewport("remote"),
                         Some("files") => self.viewport("files"),
@@ -919,8 +960,13 @@ impl eframe::App for Desktop {
                     });
                     println!(
                         "{}",
-                        json!({"event":"ui_state","target":command["target"],"id":command["id"],"focused":focused,"minimized":minimized})
+                        json!({"event":"ui_state","target":command["target"],"id":command["id"],"focused":focused,"minimized":minimized,"open":open})
                     );
+                }
+                Some("ui_scale") => {
+                    if let Some(scale) = command["factor"].as_f64() {
+                        ctx.set_zoom_factor((scale as f32).clamp(0.75, 2.0));
+                    }
                 }
                 Some("ui_ping") => {
                     println!("{}", json!({"event":"ui_pong","id":command["id"]}));

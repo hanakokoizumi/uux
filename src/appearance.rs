@@ -285,7 +285,7 @@ pub fn history_chip(ui: &mut egui::Ui, id: &str, favorite: bool) -> (Response, R
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Icon {
     Back,
     Up,
@@ -328,6 +328,114 @@ pub enum Icon {
     Control,
 }
 
+/// Diagnostic-only contact sheet, using the same painter and sizes as the UI.
+pub fn gallery(ctx: &egui::Context, open: &mut bool) {
+    use Icon::*;
+    let icons = [
+        Back,
+        Up,
+        Collapse,
+        Refresh,
+        Account,
+        Menu,
+        Minimize,
+        Maximize,
+        Close,
+        Devices,
+        All,
+        Assist,
+        AssistGroup,
+        Star,
+        StarOutline,
+        Settings,
+        Chevron,
+        Down,
+        Info,
+        Folder,
+        Sound,
+        Microphone,
+        MicrophoneMuted,
+        Picture,
+        Shield,
+        Usb,
+        Grid,
+        Keyboard,
+        Transfer,
+        Fullscreen,
+        Exit,
+        Pause,
+        Play,
+        Trash,
+        FolderAdd,
+        Edit,
+        Terminal,
+        Power,
+        Control,
+    ];
+    egui::Window::new("UI icons · 16 / 20 / 24 pt")
+        .open(open)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Grid::new("icon-gallery")
+                .num_columns(4)
+                .spacing([24.0, 8.0])
+                .show(ui, |ui| {
+                    for (i, icon) in icons.into_iter().enumerate() {
+                        ui.vertical(|ui| {
+                            ui.label(format!("{icon:?}"));
+                            ui.horizontal(|ui| {
+                                for size in [16.0, 20.0, 24.0] {
+                                    let (rect, _) =
+                                        ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                                    draw(
+                                        ui.painter(),
+                                        Rect::from_center_size(rect.center(), Vec2::splat(size)),
+                                        icon,
+                                        if matches!(icon, Star | Assist | All) {
+                                            super::BLUE
+                                        } else {
+                                            super::INK
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                        if i % 4 == 3 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+}
+
+/// A single fill and a one-physical-pixel alpha fringe, without seams between
+/// triangles. The outline must be star-shaped around `center` (star/bookmark).
+fn feathered_fill(p: &egui::Painter, center: Pos2, points: &[Pos2], color: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    let half_pixel = 0.5 / p.ctx().pixels_per_point();
+    for (i, point) in points.iter().enumerate() {
+        let previous = (*point - points[(i + points.len() - 1) % points.len()]).normalized();
+        let next = (points[(i + 1) % points.len()] - *point).normalized();
+        let a = Vec2::new(previous.y, -previous.x);
+        let b = Vec2::new(next.y, -next.x);
+        let normal = (a + b).normalized();
+        let offset = normal * (half_pixel / normal.dot(b).max(0.25));
+        mesh.colored_vertex(*point - offset, color);
+        mesh.colored_vertex(*point + offset, Color32::TRANSPARENT);
+    }
+    for i in 0..points.len() as u32 {
+        let a = 1 + 2 * i;
+        let b = 1 + 2 * ((i + 1) % points.len() as u32);
+        mesh.add_triangle(0, a, b);
+        mesh.add_triangle(a, a + 1, b);
+        mesh.add_triangle(b, a + 1, b + 1);
+    }
+    p.add(mesh);
+}
+
 pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     let origin = rect.center() - Vec2::splat(rect.width().min(rect.height()) / 2.0);
     let scale = rect.width().min(rect.height()) / 24.0;
@@ -342,6 +450,18 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             stroke,
         ));
     };
+    let curve = |v: [(f32, f32); 4]| {
+        let bezier = egui::epaint::CubicBezierShape::from_points_stroke(
+            v.map(|(x, y)| point(x, y)),
+            false,
+            Color32::TRANSPARENT,
+            Stroke::NONE,
+        );
+        p.add(egui::Shape::line(
+            bezier.flatten(Some(0.08 / p.ctx().pixels_per_point())),
+            stroke,
+        ));
+    };
     let box_at = |x: f32, y: f32, w: f32, h: f32, radius: u8| {
         p.rect_stroke(
             Rect::from_min_size(point(x, y), Vec2::new(w, h) * scale),
@@ -353,16 +473,9 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
     match icon {
         Icon::Microphone | Icon::MicrophoneMuted => {
             box_at(9., 3., 6., 12., 3);
-            path(&[
-                (6., 10.),
-                (6., 13.),
-                (7., 16.),
-                (9., 18.),
-                (15., 18.),
-                (17., 16.),
-                (18., 13.),
-                (18., 10.),
-            ]);
+            line((6., 10.), (6., 12.));
+            curve([(6., 12.), (6., 20.), (18., 20.), (18., 12.)]);
+            line((18., 12.), (18., 10.));
             line((12., 18.), (12., 22.));
             line((8., 22.), (16., 22.));
             if matches!(icon, Icon::MicrophoneMuted) {
@@ -418,18 +531,8 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Power => {
             line((12., 2.), (12., 12.));
-            path(&[
-                (7., 5.),
-                (4., 8.),
-                (3., 12.),
-                (5., 17.),
-                (9., 20.),
-                (15., 20.),
-                (19., 17.),
-                (21., 12.),
-                (20., 8.),
-                (17., 5.),
-            ]);
+            curve([(7., 5.), (0., 10.), (4., 21.), (12., 21.)]);
+            curve([(12., 21.), (20., 21.), (24., 10.), (17., 5.)]);
         }
         Icon::Edit => {
             path(&[
@@ -488,15 +591,8 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Account => {
             p.circle_stroke(point(12., 6.), 3. * scale, stroke);
-            path(&[
-                (5., 13.),
-                (19., 13.),
-                (18., 18.),
-                (15., 21.),
-                (9., 21.),
-                (6., 18.),
-                (5., 13.),
-            ]);
+            line((5., 13.), (19., 13.));
+            curve([(5., 13.), (5., 24.), (19., 24.), (19., 13.)]);
         }
         Icon::Menu => {
             for y in [6., 12., 18.] {
@@ -558,26 +654,24 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             p.add(egui::Shape::closed_line(points, stroke));
         }
         Icon::Star => {
-            p.rect_filled(
-                Rect::from_min_max(point(3., 1.), point(21., 17.)),
-                egui::CornerRadius {
-                    nw: 2,
-                    ne: 2,
-                    sw: 0,
-                    se: 0,
-                },
+            feathered_fill(
+                p,
+                point(12., 10.),
+                &[
+                    point(5., 1.),
+                    point(19., 1.),
+                    point(20., 1.27),
+                    point(20.73, 2.),
+                    point(21., 3.),
+                    point(21., 23.),
+                    point(12., 17.),
+                    point(3., 23.),
+                    point(3., 3.),
+                    point(3.27, 2.),
+                    point(4., 1.27),
+                ],
                 color,
             );
-            p.add(egui::Shape::convex_polygon(
-                vec![point(3., 17.), point(12., 17.), point(3., 23.)],
-                color,
-                Stroke::NONE,
-            ));
-            p.add(egui::Shape::convex_polygon(
-                vec![point(12., 17.), point(21., 17.), point(21., 23.)],
-                color,
-                Stroke::NONE,
-            ));
             let pts: Vec<_> = (0..10)
                 .map(|i| {
                     let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.;
@@ -585,17 +679,7 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                     point(12. + r * a.cos(), 10.5 + r * a.sin())
                 })
                 .collect();
-            // A single mesh keeps the white star solid: independently painted
-            // triangles leave antialiased seams at small system icon sizes.
-            let mut star = egui::Mesh::default();
-            star.colored_vertex(point(12., 10.5), Color32::WHITE);
-            for vertex in &pts {
-                star.colored_vertex(*vertex, Color32::WHITE);
-            }
-            for i in 0..pts.len() as u32 {
-                star.add_triangle(0, i + 1, (i + 1) % pts.len() as u32 + 1);
-            }
-            p.add(star);
+            feathered_fill(p, point(12., 10.5), &pts, Color32::WHITE);
         }
         Icon::Settings => {
             p.circle_stroke(point(12., 12.), 7. * scale, stroke);
@@ -636,7 +720,7 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 (3., 15.),
                 (3., 9.),
             ]);
-            path(&[(16., 8.), (18., 11.), (18., 13.), (16., 16.)]);
+            curve([(16., 8.), (20., 10.), (20., 14.), (16., 16.)]);
         }
         Icon::Keyboard => {
             box_at(2., 5., 20., 14., 2);

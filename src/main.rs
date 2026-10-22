@@ -4,6 +4,7 @@ mod brand;
 mod capabilities;
 mod capture_state;
 mod core;
+mod device_refresh;
 mod diagnostic_io;
 mod input;
 mod instance;
