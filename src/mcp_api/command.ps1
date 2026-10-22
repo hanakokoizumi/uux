@@ -10,7 +10,7 @@
     $uu_opending=''; $uu_epending='';
     $uu_process=[Diagnostics.Process]::new();
     $uu_process.StartInfo.FileName='powershell.exe';
-    $uu_process.StartInfo.Arguments='-NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand __SCRIPT__';
+    $uu_process.StartInfo.Arguments='-NoLogo -NoProfile -NonInteractive -OutputFormat Text -EncodedCommand '+$uu_script;
     $uu_process.StartInfo.UseShellExecute=$false;
     $uu_process.StartInfo.CreateNoWindow=$true;
     $uu_process.StartInfo.RedirectStandardOutput=$true;

@@ -19,6 +19,7 @@ pub fn open(
         let terminal = crate::service::Shell::new(client);
         let handle = terminal.id.clone();
         s.shell = Some(terminal);
+        h.retain_resource(client, id, &handle, "terminal")?;
         handle
     };
     if let Err(e) = submit(
@@ -73,6 +74,7 @@ pub fn close(hub: &Shared, client: &str, id: &str, handle: &str) -> Result<Value
         .as_ref()
         .is_some_and(|t| t.closed)
     {
+        hub.lock().unwrap().release_resource(id, handle);
         return Ok(json!({"terminal_id":handle,"closed":true}));
     }
     submit(hub, client, id, json!({"op":"terminal","action":"close"}))?;
@@ -83,6 +85,8 @@ pub fn close(hub: &Shared, client: &str, id: &str, handle: &str) -> Result<Value
             let h = hub.lock().unwrap();
             let s = h.owner(client, id)?;
             if s.shell.as_ref().is_some_and(|t| t.id == handle && t.closed) {
+                drop(h);
+                hub.lock().unwrap().release_resource(id, handle);
                 return Ok(json!({"terminal_id":handle,"closed":true}));
             }
         }
@@ -135,9 +139,20 @@ pub fn wrap(command: &str, cwd: Option<&str>, marker: &str) -> String {
     let done = base64::engine::general_purpose::STANDARD.encode(format!("UU_DONE_{marker}:"));
     let wrapper = include_str!("command.ps1")
         .replace("__OUTPUT_PREFIX__", &output)
-        .replace("__DONE_PREFIX__", &done)
-        .replace("__SCRIPT__", &encoded(&script));
-    wrapper.lines().map(str::trim).collect::<Vec<_>>().join(" ") + "\r"
+        .replace("__DONE_PREFIX__", &done);
+    // Legacy PowerShell's console input line is much smaller than CreateProcess's
+    // command line. Build the Base64 payload with short, inert assignments before
+    // launching the child; never split or evaluate user-supplied source text.
+    let mut input = String::from("$uu_script='';\r");
+    let payload = encoded(&script);
+    for chunk in payload.as_bytes().chunks(2048) {
+        input.push_str("$uu_script+='");
+        input.push_str(std::str::from_utf8(chunk).unwrap());
+        input.push_str("';\r");
+    }
+    input.push_str(&wrapper.lines().map(str::trim).collect::<Vec<_>>().join(" "));
+    input.push('\r');
+    input
 }
 fn console_text(bytes: &[u8], rows: u16, cols: u16) -> String {
     let mut parser = vt100::Parser::new(rows, cols, 2048);
@@ -402,6 +417,35 @@ mod tests {
             Some((5, 7))
         );
         assert!(marker_result(b"helloUU_DONE_abc-123:7", marker).is_none());
+    }
+    #[test]
+    fn long_unicode_script_uses_short_console_lines_without_changing_source() {
+        let command = format!("Write-Output '中文😀'; #{}", "x".repeat(7900));
+        let wrapped = wrap(&command, Some("C:\\a'b"), "long-script");
+        assert!(
+            wrapped
+                .split('\r')
+                .all(|line| line.encode_utf16().count() < 4096)
+        );
+        let payload = wrapped
+            .split('\r')
+            .filter_map(|line| line.strip_prefix("$uu_script+='")?.strip_suffix("';"))
+            .collect::<String>();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .unwrap();
+        let text = String::from_utf16(
+            &bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes(*b))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(text.contains(&command));
+        assert!(text.contains("Set-Location -LiteralPath 'C:\\a''b'"));
+        assert!(marker_result(wrapped.as_bytes(), "long-script").is_none());
     }
     #[test]
     fn console_records_preserve_unicode_and_ignore_echo() {

@@ -4,6 +4,72 @@ pub const SIDE: Color32 = Color32::from_rgb(240, 245, 248);
 pub const BORDER: Color32 = Color32::from_rgb(230, 230, 230);
 pub const SELECTED: Color32 = Color32::from_rgb(226, 231, 233);
 
+/// Native-style entry: a quiet outline, with focus indicated on the bottom edge.
+/// Keep egui's editor for selection, IME, accessibility and keyboard navigation.
+pub struct TextField<'a>(egui::TextEdit<'a>);
+impl<'a> TextField<'a> {
+    pub fn new(text: &'a mut String) -> Self {
+        Self(egui::TextEdit::singleline(text).align(egui::Align2::LEFT_CENTER))
+    }
+    pub fn hint_text(mut self, text: impl Into<egui::WidgetText>) -> Self {
+        self.0 = self.0.hint_text(text);
+        self
+    }
+    pub fn id_salt(mut self, id: impl egui::AsIdSalt) -> Self {
+        self.0 = self.0.id_salt(id);
+        self
+    }
+    pub fn char_limit(mut self, limit: usize) -> Self {
+        self.0 = self.0.char_limit(limit);
+        self
+    }
+    pub fn password(mut self, password: bool) -> Self {
+        self.0 = self.0.password(password);
+        self
+    }
+    pub fn font(mut self, font: impl Into<egui::FontSelection>) -> Self {
+        self.0 = self.0.font(font);
+        self
+    }
+    #[cfg(test)]
+    pub fn desired_width(mut self, width: f32) -> Self {
+        self.0 = self.0.desired_width(width);
+        self
+    }
+    pub fn min_size(mut self, size: Vec2) -> Self {
+        self.0 = self.0.min_size(size);
+        self
+    }
+    pub fn margin(mut self, margin: impl Into<egui::Margin>) -> Self {
+        self.0 = self.0.margin(margin);
+        self
+    }
+    pub fn show(self, ui: &mut egui::Ui) -> egui::text_edit::TextEditOutput {
+        let old_selection = ui.visuals().selection;
+        ui.visuals_mut().selection.bg_fill = super::BLUE;
+        ui.visuals_mut().selection.stroke.color = Color32::WHITE;
+        let output = self.0.show(ui);
+        ui.visuals_mut().selection = old_selection;
+        // Paint inside the existing frame: preserve the editor's allocated size.
+        if output.response.has_focus() {
+            let rect = output.response.rect;
+            ui.painter()
+                .rect_stroke(rect, 3, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+            ui.painter().hline(
+                rect.x_range(),
+                rect.bottom() - 1.0,
+                Stroke::new(2.0, super::BLUE),
+            );
+        }
+        output
+    }
+}
+impl egui::Widget for TextField<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> Response {
+        self.show(ui).response.response
+    }
+}
+
 /// Shared hover/press feedback for our painted controls. Disabled controls must
 /// never look actionable; egui handles their reduced opacity.
 pub fn hover_background(ui: &egui::Ui, response: &Response, rect: Rect) {
@@ -38,8 +104,22 @@ pub fn primary(ui: &mut egui::Ui, label: &str, size: Vec2) -> Response {
         }
         if !ui.is_enabled() {
             ui.visuals_mut().widgets.inactive.weak_bg_fill = Color32::from_rgb(203, 205, 207);
+            // The disabled fill is already gray. Do not fade it a second time.
+            ui.visuals_mut().disabled_alpha = 1.0;
+            if ui.is_visible() {
+                ui.set_opacity(1.0);
+            }
         }
-        ui.add(egui::Button::new(egui::RichText::new(label).color(Color32::WHITE)).min_size(size))
+        // Menu UIs align ordinary button text to the left. Primary actions keep
+        // the same centered label in a popup as in a form or dialog.
+        ui.add(
+            egui::Button::new((
+                egui::Atom::grow(),
+                egui::RichText::new(label).color(Color32::WHITE),
+                egui::Atom::grow(),
+            ))
+            .min_size(size),
+        )
     })
     .inner
 }
@@ -57,6 +137,154 @@ pub fn flat_button(ui: &mut egui::Ui, label: &str, size: Vec2) -> Response {
     response
 }
 
+pub fn icon_label(ui: &mut egui::Ui, icon: Icon, label: &str, size: Vec2) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    hover_background(ui, &response, rect);
+    let text = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        super::INK,
+    );
+    let left = rect.center().x - (text.size().x + 22.0) * 0.5;
+    draw(
+        ui.painter(),
+        Rect::from_center_size(egui::pos2(left + 7.0, rect.center().y), Vec2::splat(14.0)),
+        icon,
+        super::INK,
+    );
+    ui.painter().galley(
+        egui::pos2(left + 22.0, rect.center().y - text.size().y * 0.5),
+        text,
+        super::INK,
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+    response
+}
+
+pub fn screen_tab(ui: &mut egui::Ui, title: &str, selected: bool) -> (Response, Response) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(190.0, 32.0), Sense::click());
+    let corners = egui::CornerRadius {
+        nw: 8,
+        ne: 8,
+        sw: 0,
+        se: 0,
+    };
+    if selected || response.hovered() {
+        ui.painter()
+            .rect_filled(rect, corners, if selected { Color32::WHITE } else { SIDE });
+    }
+    draw(
+        ui.painter(),
+        Rect::from_center_size(rect.left_center() + Vec2::new(15.0, 0.0), Vec2::splat(16.0)),
+        Icon::Fullscreen,
+        super::INK,
+    );
+    let mut job = egui::text::LayoutJob::simple_singleline(
+        title.into(),
+        egui::FontId::proportional(12.0),
+        super::INK,
+    );
+    job.wrap.max_width = rect.width() - 60.0;
+    job.wrap.max_rows = 1;
+    let text = ui.painter().layout_job(job);
+    ui.painter().galley(
+        rect.left_center() + Vec2::new(29.0, -text.size().y * 0.5),
+        text,
+        super::INK,
+    );
+    let close_rect = Rect::from_center_size(
+        rect.right_center() - Vec2::new(15.0, 0.0),
+        Vec2::splat(22.0),
+    );
+    let close = ui.interact(close_rect, response.id.with("close"), Sense::click());
+    if response.hovered() || close.hovered() {
+        hover_background(ui, &close, close_rect);
+        draw(
+            ui.painter(),
+            close_rect.shrink(3.0),
+            Icon::Close,
+            super::INK,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Tab, ui.is_enabled(), title));
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "关闭屏幕视图")
+    });
+    (
+        response
+            .on_hover_text(title)
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+        close.on_hover_text("关闭此屏幕视图，不移除远端显示器"),
+    )
+}
+
+/// A recent partner entry has three separate hit targets, like the native list.
+pub fn history_chip(ui: &mut egui::Ui, id: &str, favorite: bool) -> (Response, Response, Response) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(132.0, 28.0), Sense::hover());
+    ui.painter().rect_filled(rect, 3, Color32::WHITE);
+    ui.painter()
+        .rect_stroke(rect, 3, Stroke::new(1.0, BORDER), egui::StrokeKind::Inside);
+    let star_rect = Rect::from_min_max(rect.min, Pos2::new(rect.left() + 28.0, rect.bottom()));
+    let close_rect = Rect::from_min_max(Pos2::new(rect.right() - 26.0, rect.top()), rect.max);
+    let body_rect = Rect::from_min_max(star_rect.right_top(), close_rect.left_bottom());
+    let star = ui.interact(
+        star_rect,
+        ui.scope_id().with((id, "favorite")),
+        Sense::click(),
+    );
+    let close = ui.interact(
+        close_rect,
+        ui.scope_id().with((id, "remove")),
+        Sense::click(),
+    );
+    let body = ui.interact(
+        body_rect,
+        ui.scope_id().with((id, "select")),
+        Sense::click(),
+    );
+    for response in [&star, &close, &body] {
+        hover_background(ui, response, response.rect.shrink(1.0));
+    }
+    draw(
+        ui.painter(),
+        Rect::from_center_size(star_rect.center(), Vec2::splat(14.0)),
+        Icon::StarOutline,
+        if favorite { super::BLUE } else { super::MUTED },
+    );
+    draw(
+        ui.painter(),
+        Rect::from_center_size(close_rect.center(), Vec2::splat(12.0)),
+        Icon::Close,
+        super::MUTED,
+    );
+    ui.painter().text(
+        body_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        id,
+        egui::FontId::proportional(12.0),
+        super::INK,
+    );
+    body.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), id));
+    star.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), favorite, "收藏设备")
+    });
+    close.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "删除此条记录")
+    });
+    (
+        body.on_hover_cursor(egui::CursorIcon::PointingHand),
+        star.on_hover_text(if favorite {
+            "取消收藏"
+        } else {
+            "收藏设备"
+        })
+        .on_hover_cursor(egui::CursorIcon::PointingHand),
+        close
+            .on_hover_text("删除此条记录")
+            .on_hover_cursor(egui::CursorIcon::PointingHand),
+    )
+}
+
 #[derive(Clone, Copy)]
 pub enum Icon {
     Back,
@@ -71,13 +299,21 @@ pub enum Icon {
     Devices,
     All,
     Assist,
+    AssistGroup,
     Star,
+    StarOutline,
     Settings,
     Chevron,
     Down,
     Info,
     Folder,
     Sound,
+    Microphone,
+    MicrophoneMuted,
+    Picture,
+    Shield,
+    Usb,
+    Grid,
     Keyboard,
     Transfer,
     Fullscreen,
@@ -89,6 +325,7 @@ pub enum Icon {
     Edit,
     Terminal,
     Power,
+    Control,
 }
 
 pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
@@ -114,6 +351,66 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
         );
     };
     match icon {
+        Icon::Microphone | Icon::MicrophoneMuted => {
+            box_at(9., 3., 6., 12., 3);
+            path(&[
+                (6., 10.),
+                (6., 13.),
+                (7., 16.),
+                (9., 18.),
+                (15., 18.),
+                (17., 16.),
+                (18., 13.),
+                (18., 10.),
+            ]);
+            line((12., 18.), (12., 22.));
+            line((8., 22.), (16., 22.));
+            if matches!(icon, Icon::MicrophoneMuted) {
+                line((4., 3.), (21., 21.));
+            }
+        }
+        Icon::Picture => {
+            box_at(5., 3., 16., 17., 2);
+            path(&[(3., 6.), (2., 6.), (2., 22.), (17., 22.)]);
+            p.circle_stroke(point(10., 8.), 1.8 * scale, stroke);
+            path(&[(6., 17.), (11., 12.), (14., 15.), (17., 11.), (20., 15.)]);
+        }
+        Icon::Shield => {
+            p.add(egui::Shape::closed_line(
+                vec![
+                    point(12., 2.),
+                    point(21., 6.),
+                    point(20., 14.),
+                    point(17., 19.),
+                    point(12., 23.),
+                    point(7., 19.),
+                    point(4., 14.),
+                    point(3., 6.),
+                ],
+                stroke,
+            ));
+            path(&[(12., 7.), (10., 12.), (14., 12.), (12., 17.)]);
+        }
+        Icon::Usb => {
+            line((12., 20.), (12., 3.));
+            path(&[(9., 6.), (12., 3.), (15., 6.)]);
+            path(&[(12., 16.), (6., 12.), (6., 8.)]);
+            path(&[(12., 13.), (18., 9.), (18., 6.)]);
+            p.circle_stroke(point(12., 21.), 1.8 * scale, stroke);
+            p.circle_stroke(point(6., 6.), 1.8 * scale, stroke);
+            box_at(16.5, 3., 3., 3., 0);
+        }
+        Icon::Grid => {
+            for (x, y) in [(3., 3.), (14., 3.), (3., 14.), (14., 14.)] {
+                box_at(x, y, 7., 7., 1);
+            }
+        }
+        Icon::Control => {
+            box_at(3., 3., 18., 7., 3);
+            box_at(3., 14., 18., 7., 3);
+            p.circle_filled(point(8., 6.5), 1.6 * scale, color);
+            p.circle_filled(point(16., 17.5), 1.6 * scale, color);
+        }
         Icon::Terminal => {
             box_at(3., 5., 18., 15., 2);
             path(&[(6., 9.), (9., 12.), (6., 15.)]);
@@ -219,24 +516,86 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             line((9., 15.), (9., 19.));
         }
         Icon::All => {
-            for (x, y) in [(7., 7.), (17., 7.), (7., 17.), (17., 17.)] {
-                p.circle_filled(point(x, y), 4.6 * scale, color);
+            for (x, y, opacity) in [
+                (6.5, 6.5, 0.7),
+                (17.5, 6.5, 1.0),
+                (6.5, 17.5, 1.0),
+                (17.5, 17.5, 0.7),
+            ] {
+                // Leave room for both antialiased edges at small icon sizes.
+                p.circle_filled(point(x, y), 4.2 * scale, color.gamma_multiply(opacity));
             }
         }
         Icon::Assist => {
-            box_at(2., 4., 12., 10., 2);
-            box_at(11., 11., 11., 10., 2);
-            line((4., 18.), (8., 18.));
+            p.rect_filled(
+                Rect::from_min_max(point(2., 10.), point(12., 21.)),
+                2,
+                color,
+            );
+            p.rect_filled(
+                Rect::from_min_max(point(11., 2.), point(22., 13.)),
+                2,
+                color,
+            );
+            path(&[(3., 7.), (3., 3.), (8., 3.)]);
+            path(&[(16., 20.), (21., 20.), (21., 16.)]);
         }
-        Icon::Star => {
-            let pts = (0..10)
+        Icon::AssistGroup => {
+            box_at(2., 3., 8., 6., 1);
+            box_at(14., 14., 8., 6., 1);
+            path(&[(14., 4.), (21., 4.), (21., 9.)]);
+            path(&[(2., 14.), (2., 20.), (9., 20.)]);
+        }
+        Icon::StarOutline => {
+            let points = (0..10)
                 .map(|i| {
-                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.;
-                    let r = if i % 2 == 0 { 10. } else { 4.5 };
-                    point(12. + r * a.cos(), 12. + r * a.sin())
+                    let angle =
+                        -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
+                    let radius = if i % 2 == 0 { 10.0 } else { 4.5 };
+                    point(12.0 + radius * angle.cos(), 12.0 + radius * angle.sin())
                 })
                 .collect();
-            p.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+            p.add(egui::Shape::closed_line(points, stroke));
+        }
+        Icon::Star => {
+            p.rect_filled(
+                Rect::from_min_max(point(3., 1.), point(21., 17.)),
+                egui::CornerRadius {
+                    nw: 2,
+                    ne: 2,
+                    sw: 0,
+                    se: 0,
+                },
+                color,
+            );
+            p.add(egui::Shape::convex_polygon(
+                vec![point(3., 17.), point(12., 17.), point(3., 23.)],
+                color,
+                Stroke::NONE,
+            ));
+            p.add(egui::Shape::convex_polygon(
+                vec![point(12., 17.), point(21., 17.), point(21., 23.)],
+                color,
+                Stroke::NONE,
+            ));
+            let pts: Vec<_> = (0..10)
+                .map(|i| {
+                    let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.;
+                    let r = if i % 2 == 0 { 6.5 } else { 3.0 };
+                    point(12. + r * a.cos(), 10.5 + r * a.sin())
+                })
+                .collect();
+            // A single mesh keeps the white star solid: independently painted
+            // triangles leave antialiased seams at small system icon sizes.
+            let mut star = egui::Mesh::default();
+            star.colored_vertex(point(12., 10.5), Color32::WHITE);
+            for vertex in &pts {
+                star.colored_vertex(*vertex, Color32::WHITE);
+            }
+            for i in 0..pts.len() as u32 {
+                star.add_triangle(0, i + 1, (i + 1) % pts.len() as u32 + 1);
+            }
+            p.add(star);
         }
         Icon::Settings => {
             p.circle_stroke(point(12., 12.), 7. * scale, stroke);
@@ -312,7 +671,10 @@ pub fn draw(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
 }
 
 pub fn button(ui: &mut egui::Ui, icon: Icon, title: &str) -> Response {
-    let (r, response) = ui.allocate_exact_size(Vec2::new(38., 32.), Sense::click());
+    sized_icon_button(ui, icon, title, Vec2::new(38., 32.))
+}
+pub fn sized_icon_button(ui: &mut egui::Ui, icon: Icon, title: &str, size: Vec2) -> Response {
+    let (r, response) = ui.allocate_exact_size(size, Sense::click());
     hover_background(ui, &response, r);
     draw(
         ui.painter(),
@@ -328,32 +690,7 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, title: &str) -> Response {
 }
 
 pub fn logo(p: &egui::Painter, center: Pos2, size: f32) {
-    let s = size / 24.;
-    let pt = |x: f32, y: f32| center + Vec2::new(x - 12., y - 12.) * s;
-    for (v, c) in [
-        (
-            vec![(12., 1.), (12., 12.), (22., 12.)],
-            Color32::from_rgb(0, 101, 255),
-        ),
-        (
-            vec![(12., 1.), (5., 12.), (12., 12.)],
-            Color32::from_rgb(62, 185, 255),
-        ),
-        (
-            vec![(2., 12.), (12., 12.), (12., 23.)],
-            Color32::from_rgb(0, 215, 224),
-        ),
-        (
-            vec![(12., 12.), (22., 12.), (12., 23.)],
-            Color32::from_rgb(0, 128, 236),
-        ),
-    ] {
-        p.add(egui::Shape::convex_polygon(
-            v.into_iter().map(|(x, y)| pt(x, y)).collect(),
-            c,
-            Stroke::NONE,
-        ));
-    }
+    crate::brand::paint(p, center, size);
 }
 
 pub fn window_buttons(ui: &mut egui::Ui) {
@@ -372,7 +709,7 @@ pub fn window_buttons(ui: &mut egui::Ui) {
 }
 
 pub fn toggle(ui: &mut egui::Ui, value: &mut bool) -> Response {
-    let (r, mut response) = ui.allocate_exact_size(Vec2::new(40., 22.), Sense::click());
+    let (r, mut response) = ui.allocate_exact_size(Vec2::new(40., 20.), Sense::click());
     if response.clicked() {
         *value = !*value;
         response.mark_changed();
@@ -407,13 +744,13 @@ pub fn toggle(ui: &mut egui::Ui, value: &mut bool) -> Response {
     ui.painter().circle_filled(
         egui::pos2(
             if *value {
-                r.right() - 11.
+                r.right() - 10.
             } else {
-                r.left() + 11.
+                r.left() + 10.
             },
             r.center().y,
         ),
-        7.,
+        6.,
         if *value {
             Color32::WHITE
         } else {
@@ -429,7 +766,7 @@ mod tests {
 
     #[test]
     fn painted_controls_have_hover_feedback_and_disabled_controls_do_not() {
-        for kind in 0..6 {
+        for kind in 0..11 {
             for enabled in [true, false] {
                 let ctx = egui::Context::default();
                 super::super::setup(&ctx);
@@ -456,7 +793,17 @@ mod tests {
                                     2 => toggle(ui, &mut true),
                                     3 => toggle(ui, &mut false),
                                     4 => ui.button("Standard"),
-                                    _ => flat_button(ui, "More", Vec2::new(32.0, 28.0)),
+                                    5 => flat_button(ui, "More", Vec2::new(32.0, 28.0)),
+                                    6 => icon_label(
+                                        ui,
+                                        Icon::Pause,
+                                        "全部暂停",
+                                        Vec2::new(116.0, 28.0),
+                                    ),
+                                    7 => screen_tab(ui, "显示器", false).0,
+                                    8 => history_chip(ui, "957857075", false).0,
+                                    9 => history_chip(ui, "957857075", false).1,
+                                    _ => history_chip(ui, "957857075", false).2,
                                 })
                                 .inner
                                 .rect
@@ -482,6 +829,78 @@ mod tests {
                     assert_ne!(hovered.1, egui::CursorIcon::PointingHand);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn recent_partner_actions_have_independent_hit_targets() {
+        let ctx = egui::Context::default();
+        super::super::setup(&ctx);
+        let render = |events| {
+            let mut result = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 100.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    result = Some(history_chip(ui, "957857075", false));
+                },
+            )
+            .drop_without_applying_deltas();
+            let (select, favorite, remove) = result.unwrap();
+            [select, favorite, remove]
+        };
+        let targets = render(vec![]).map(|response| response.rect.center());
+        for (selected, pos) in targets.into_iter().enumerate() {
+            render(vec![egui::Event::PointerMoved(pos)]);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            render(vec![button(true)]);
+            for (index, response) in render(vec![button(false)]).into_iter().enumerate() {
+                assert_eq!(response.clicked(), index == selected);
+            }
+        }
+    }
+
+    #[test]
+    fn closing_screen_tab_does_not_select_its_body() {
+        let ctx = egui::Context::default();
+        super::super::setup(&ctx);
+        let render = |events| {
+            let mut result = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 100.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    result = Some(screen_tab(ui, "很长的显示器名称", false));
+                },
+            )
+            .drop_without_applying_deltas();
+            result.unwrap()
+        };
+        let (tab, close) = render(vec![]);
+        assert!(tab.rect.contains_rect(close.rect));
+        for (position, closing) in [(tab.rect.center(), false), (close.rect.center(), true)] {
+            render(vec![egui::Event::PointerMoved(position)]);
+            let button = |pressed| egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            render(vec![button(true)]);
+            let (tab, close) = render(vec![button(false)]);
+            assert_eq!(close.clicked(), closing);
+            assert_eq!(tab.clicked(), !closing);
         }
     }
 }

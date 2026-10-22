@@ -294,6 +294,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         (
             Output {
+                media: Default::default(),
                 generation: Some(1),
                 events: tx,
                 latest: Default::default(),

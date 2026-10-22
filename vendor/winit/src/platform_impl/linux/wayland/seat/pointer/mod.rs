@@ -155,6 +155,9 @@ impl PointerHandler for WinitState {
                 },
                 ref kind @ PointerEventKind::Press { button, serial, .. }
                 | ref kind @ PointerEventKind::Release { button, serial, .. } => {
+                    if let Some(activation) = &self.xdg_activation {
+                        activation.input.record(parent_surface, seat, serial);
+                    }
                     // Update the last button serial.
                     pointer.winit_data().inner.lock().unwrap().latest_button_serial = serial;
 

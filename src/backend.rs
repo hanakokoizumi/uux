@@ -105,6 +105,7 @@ pub fn repaint_ui(ctx: &egui::Context, video_only: bool) {
 }
 
 pub struct VideoFrame {
+    pub geometry: crate::media_bus::Geometry,
     pub generation: u64,
     pub sequence: u64,
     pub width: usize,
@@ -115,6 +116,7 @@ pub struct VideoFrame {
 }
 
 pub struct Backend {
+    pub media: Arc<crate::media_bus::MediaBus>,
     commands: Option<tokio::sync::mpsc::Sender<Value>>,
     pub events: mpsc::Receiver<Event>,
     pub latest: Arc<Mutex<Option<VideoFrame>>>,
@@ -145,7 +147,9 @@ impl Backend {
         let (tx, rx) = tokio::sync::mpsc::channel(1024);
         let (events_tx, events) = mpsc::channel();
         let latest = Arc::new(Mutex::new(None));
+        let media = Arc::new(crate::media_bus::MediaBus::default());
         let output = Output {
+            media: media.clone(),
             generation: None,
             events: events_tx,
             latest: latest.clone(),
@@ -153,6 +157,7 @@ impl Backend {
         };
         let worker = thread::spawn(move || rt.block_on(runtime::run(cloud, output, rx)));
         Ok(Self {
+            media: media.clone(),
             commands: Some(tx),
             events,
             latest,
@@ -190,6 +195,7 @@ impl Backend {
     }
 
     pub fn shared(state: Option<&Path>, ctx: egui::Context) -> Result<Self, String> {
+        let media = Arc::new(crate::media_bus::MediaBus::default());
         let client =
             Arc::new(crate::ipc::Client::connect(state, "gui").map_err(|e| e.to_string())?);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(1024);
@@ -269,6 +275,7 @@ impl Backend {
             }
         });
         Ok(Self {
+            media,
             commands: Some(tx),
             events,
             latest,
@@ -295,6 +302,7 @@ impl Backend {
         let (sender, events) = mpsc::channel();
         (
             Self {
+                media: Arc::new(crate::media_bus::MediaBus::default()),
                 commands: Some(commands),
                 events,
                 latest: Arc::new(Mutex::new(None)),

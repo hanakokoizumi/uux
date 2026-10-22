@@ -94,6 +94,9 @@ pub struct Managed {
     pub ended: bool,
     pub closing: bool,
     pub video_owners: HashSet<String>,
+    pub media_owners: HashMap<String, String>,
+    pub resource_leases: HashMap<String, (String, String)>,
+    pub admissions: HashMap<String, Vec<String>>,
     pub phase: String,
     pub events: Journal,
     pub snapshot: HashMap<String, Value>,
@@ -122,13 +125,25 @@ pub struct Job {
     pub result: Value,
     pub error: Option<String>,
     pub cancelled: bool,
+    pub paused: bool,
     pub created: u64,
     pub updated: u64,
     pub transfer_ids: Vec<i32>,
 }
 impl Job {
+    pub fn supported_actions(&self) -> Vec<&'static str> {
+        if matches!(self.state.as_str(), "completed" | "failed" | "cancelled") {
+            return Vec::new();
+        }
+        match self.kind.as_str() {
+            "transfer" => vec!["cancel", "pause", "resume"],
+            "command" | "search" | "read_text" | "write_text" => vec!["cancel"],
+            // A submitted display RPC cannot be revoked at the remote host.
+            _ => Vec::new(),
+        }
+    }
     pub fn value(&self, id: &str) -> Value {
-        json!({"task_id":id,"session_id":self.session,"kind":self.kind,"state":self.state,"result":self.result,"error":self.error,"created_at_ms":self.created,"updated_at_ms":self.updated})
+        json!({"task_id":id,"session_id":self.session,"kind":self.kind,"state":self.state,"result":self.result,"error":self.error,"created_at_ms":self.created,"updated_at_ms":self.updated,"requested_paused":self.paused,"supported_actions":self.supported_actions()})
     }
 }
 pub struct Hub {
@@ -141,8 +156,10 @@ pub struct Hub {
     pub sessions: HashMap<String, Managed>,
     pub clients: HashMap<String, Subscriber>,
     pub jobs: HashMap<String, Job>,
+    pub streams: HashMap<String, crate::streams::Handle>,
     pub shots: HashMap<String, crate::mcp_api::desktop::Shot>,
     pub operations: HashSet<(String, String)>,
+    clipboard_owner: Option<(String, String)>,
     pub enabled: bool,
     pub stopping: bool,
 }
@@ -164,11 +181,42 @@ impl Hub {
             sessions: HashMap::new(),
             clients: HashMap::new(),
             jobs: HashMap::new(),
+            streams: HashMap::new(),
             shots: HashMap::new(),
             operations: HashSet::new(),
+            clipboard_owner: None,
             enabled: settings["enabled"].as_bool().unwrap_or(true),
             stopping: false,
         })
+    }
+    fn clipboard_focus(&mut self, client: &str, sid: &str, enabled: bool) -> Result<()> {
+        self.owner(client, sid)?;
+        let desired = if enabled {
+            Some((sid.to_owned(), client.to_owned()))
+        } else {
+            None
+        };
+        if self.clipboard_owner == desired {
+            return Ok(());
+        }
+        if !enabled
+            && self
+                .clipboard_owner
+                .as_ref()
+                .is_some_and(|(s, c)| s != sid || c != client)
+        {
+            return Ok(());
+        }
+        if let Some((old, _)) = self.clipboard_owner.take()
+            && let Some(s) = self.sessions.get(&old)
+        {
+            s.send(json!({"op":"clipboard_enabled","enabled":false}))?;
+        }
+        if enabled {
+            self.sessions[sid].send(json!({"op":"clipboard_enabled","enabled":true}))?;
+            self.clipboard_owner = desired;
+        }
+        Ok(())
     }
     pub fn register(&mut self, kind: &str) -> Result<String> {
         ensure!(["gui", "mcp"].contains(&kind), "未知客户端类型");
@@ -237,7 +285,8 @@ impl Hub {
             let mut settings = args["settings"].as_object().cloned().unwrap_or_default();
             settings.entry("wait_for_video").or_insert(json!(false));
             settings.entry("audio").or_insert(json!(false));
-            settings.entry("clipboard").or_insert(json!(false));
+            // Only the focused GUI view may bridge the one system clipboard.
+            settings.insert("clipboard".into(), json!(false));
             settings.entry("drag_receive").or_insert(json!(false));
             if !settings.contains_key("super_screen") {
                 let prefs = preferences(&self.directory);
@@ -259,6 +308,9 @@ impl Hub {
                     ended: false,
                     closing: false,
                     video_owners: HashSet::new(),
+                    media_owners: HashMap::new(),
+                    resource_leases: HashMap::new(),
+                    admissions: HashMap::new(),
                     phase: "connecting".into(),
                     events: Default::default(),
                     snapshot: HashMap::new(),
@@ -292,9 +344,91 @@ impl Hub {
         } else {
             s.video_owners.remove(client);
         }
-        s.send(json!({"op":"expect_video","enabled":!s.video_owners.is_empty()}))
+        self.refresh_media(id)
     }
+    pub fn refresh_media(&self, sid: &str) -> Result<()> {
+        let s = self.sessions.get(sid).context("会话不存在")?;
+        let video = !s.video_owners.is_empty()
+            || self.streams.values().any(|v| v.session == sid && v.video);
+        let audio = self.streams.values().any(|v| v.session == sid && v.audio);
+        s.send(json!({"op":"expect_video","enabled":video}))?;
+        s.send(json!({"op":"audio_receive","enabled":audio}))
+    }
+    pub fn retain_resource(
+        &mut self,
+        client: &str,
+        sid: &str,
+        resource: &str,
+        kind: &str,
+    ) -> Result<()> {
+        self.ready(client, sid)?;
+        self.sessions
+            .get_mut(sid)
+            .unwrap()
+            .resource_leases
+            .insert(resource.into(), (client.into(), kind.into()));
+        Ok(())
+    }
+    pub fn release_resource(&mut self, sid: &str, resource: &str) {
+        if let Some(s) = self.sessions.get_mut(sid) {
+            s.resource_leases.remove(resource);
+        }
+        self.reconcile_owners(sid);
+    }
+    fn reconcile_owners(&mut self, sid: &str) {
+        let explicit: HashSet<String> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.sessions.contains(sid))
+            .map(|(id, _)| id.clone())
+            .collect();
+        if let Some(s) = self.sessions.get_mut(sid) {
+            s.owners = explicit;
+            s.owners
+                .extend(s.resource_leases.values().map(|(owner, _)| owner.clone()));
+            if s.owners.is_empty() && !s.ended && !s.closing {
+                s.closing = true;
+                let _ = s.backend.send(json!({"op":"disconnect"}));
+            }
+        }
+    }
+    /// Release the explicit view/client attachment; tasks and streams retain their own lease.
     pub fn release(&mut self, client: &str, sid: &str) {
+        let _ = self.clipboard_focus(client, sid, false);
+        let gui = self.clients.get(client).is_some_and(|c| c.kind == "gui");
+        let resources = self
+            .sessions
+            .get(sid)
+            .is_some_and(|s| s.resource_leases.values().any(|(owner, _)| owner == client));
+        if let Some(c) = self.clients.get_mut(client) {
+            c.sessions.remove(sid);
+            if !resources && c.gui.as_ref().is_some_and(|(id, _)| id == sid) {
+                c.gui = None;
+            }
+        }
+        if let Some(s) = self.sessions.get_mut(sid) {
+            s.video_owners.remove(client);
+            if s.input_owner.as_deref() == Some(client) {
+                let _ = s.send(json!({"op":"release"}));
+                s.input_owner = None;
+            }
+            let _ = s.send(json!({"op":"expect_video","enabled":!s.video_owners.is_empty()}));
+            for op in ["audio", "microphone"] {
+                if s.media_owners.get(op).is_some_and(|owner| owner == client) {
+                    let _ = s.send(json!({"op":op,"enabled":false}));
+                    s.media_owners.remove(op);
+                }
+            }
+            if gui {
+                let _ = s.send(json!({"op":"drag_receive","enabled":false}));
+            }
+        }
+        let _ = self.refresh_media(sid);
+        self.reconcile_owners(sid);
+    }
+    /// A disconnected client revokes all of its resources, without touching peers.
+    fn revoke(&mut self, client: &str, sid: &str) {
+        let _ = self.clipboard_focus(client, sid, false);
         let mut transfers = Vec::new();
         if let Some(c) = self.clients.get_mut(client) {
             c.sessions.remove(sid);
@@ -311,6 +445,15 @@ impl Hub {
             transfers.extend(job.transfer_ids.iter().copied());
         }
         if let Some(s) = self.sessions.get_mut(sid) {
+            transfers.extend(
+                s.resource_leases
+                    .iter()
+                    .filter(|(_, (owner, _))| owner == client)
+                    .filter_map(|(key, _)| {
+                        key.strip_prefix("gui-transfer:")
+                            .and_then(|n| n.parse::<i32>().ok())
+                    }),
+            );
             for id in transfers {
                 let _ = s.send(json!({"op":"transfer_cancel","id":id}));
             }
@@ -334,14 +477,19 @@ impl Hub {
                 let _ = s.send(json!({"op":"port_mapping","id":id,"enabled":false}));
                 s.ports.remove(&id);
             }
+            s.resource_leases.retain(|_, (owner, _)| owner != client);
             s.owners.remove(client);
             if s.video_owners.remove(client) && !s.owners.is_empty() {
                 let _ = s.send(json!({"op":"expect_video","enabled":!s.video_owners.is_empty()}));
             }
-            if self.clients.get(client).is_some_and(|c| c.kind == "gui") && !s.owners.is_empty() {
-                for op in ["audio", "clipboard_enabled", "drag_receive"] {
+            for op in ["audio", "microphone"] {
+                if s.media_owners.get(op).is_some_and(|owner| owner == client) {
                     let _ = s.send(json!({"op":op,"enabled":false}));
+                    s.media_owners.remove(op);
                 }
+            }
+            if self.clients.get(client).is_some_and(|c| c.kind == "gui") && !s.owners.is_empty() {
+                let _ = s.send(json!({"op":"drag_receive","enabled":false}));
             }
             if s.owners.is_empty() {
                 s.closing = true;
@@ -350,13 +498,16 @@ impl Hub {
         }
     }
     pub fn remove_client(&mut self, client: &str) {
-        let sessions = self
-            .clients
-            .get(client)
-            .map(|c| c.sessions.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        self.streams.retain(|_, sub| sub.owner != client);
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.owners.contains(client))
+            .map(|(id, _)| id.clone())
+            .collect();
         for sid in sessions {
-            self.release(client, &sid);
+            self.revoke(client, &sid);
+            let _ = self.refresh_media(&sid);
         }
         self.clients.remove(client);
         self.shots.retain(|_, shot| shot.owner != client);
@@ -391,6 +542,65 @@ impl Hub {
                     }
                     Event::Phase { phase, .. } => s.phase = phase.clone(),
                     Event::Native { kind, data } => {
+                        if kind == "command_result"
+                            && let Some(request) = data["client_request"].as_str()
+                            && let Some(leases) = s.admissions.remove(request)
+                            && data["ok"] != true
+                        {
+                            for lease in leases {
+                                s.resource_leases.remove(&lease);
+                            }
+                        }
+                        if kind == "transfer"
+                            && let Some(id) = data["id"].as_i64()
+                        {
+                            let terminal = matches!(
+                                data["status"].as_str(),
+                                Some(
+                                    "已完成"
+                                        | "失败"
+                                        | "已取消"
+                                        | "连接已断开"
+                                        | "已跳过同名文件"
+                                        | "传输超时"
+                                )
+                            );
+                            let job_owned = self.jobs.values().any(|j| {
+                                j.session == s.id && j.transfer_ids.contains(&(id as i32))
+                            });
+                            if !terminal
+                                && !job_owned
+                                && !s
+                                    .resource_leases
+                                    .contains_key(&format!("gui-transfer:{id}"))
+                                && let Some(owner) = s
+                                    .owners
+                                    .iter()
+                                    .find(|c| self.clients.get(*c).is_some_and(|c| c.kind == "gui"))
+                            {
+                                s.resource_leases.insert(
+                                    format!("gui-transfer:{id}"),
+                                    (owner.clone(), "transfer".into()),
+                                );
+                            }
+                        }
+                        if kind == "transfer"
+                            && matches!(
+                                data["status"].as_str(),
+                                Some(
+                                    "已完成"
+                                        | "失败"
+                                        | "已取消"
+                                        | "已跳过同名文件"
+                                        | "连接已断开"
+                                        | "传输超时"
+                                )
+                            )
+                            && let Some(id) = data["id"].as_i64()
+                        {
+                            s.resource_leases.remove(&format!("gui-transfer:{id}"));
+                        }
+
                         if kind == "terminal_output" {
                             use base64::Engine;
                             if let Some(t) = &mut s.shell
@@ -430,6 +640,11 @@ impl Hub {
                         {
                             rule["status"] = data["status"].clone();
                             rule["message"] = data["message"].clone();
+                            for key in ["listening", "last_target_state", "enabled"] {
+                                if let Some(value) = data.get(key) {
+                                    rule[key] = value.clone();
+                                }
+                            }
                         }
                         if [
                             "screens",
@@ -437,6 +652,16 @@ impl Hub {
                             "remote_capture",
                             "stats",
                             "capabilities",
+                            "remote_streamer",
+                            "remote_encoders",
+                            "remote_features",
+                            "remote_general",
+                            "decoder_status",
+                            "audio_status",
+                            "audio_negotiation",
+                            "microphone_status",
+                            "microphone_policy",
+                            "display_requested",
                             "clipboard_value",
                         ]
                         .contains(&kind.as_str())
@@ -452,6 +677,17 @@ impl Hub {
             if let Some(frame) = s.backend.latest.lock().unwrap().take() {
                 s.frame = Some(Arc::new(frame));
             }
+        }
+        for s in self.sessions.values_mut() {
+            if let Some(t) = &s.shell
+                && t.closed
+                && self.clients.get(&t.owner).is_some_and(|c| c.kind == "gui")
+            {
+                s.resource_leases.remove(&t.id);
+            }
+        }
+        for id in self.sessions.keys().cloned().collect::<Vec<_>>() {
+            self.reconcile_owners(&id);
         }
         // Remove fully released backends outside live use. shutdown is short after Disconnected.
         self.sessions
@@ -486,6 +722,20 @@ impl Hub {
             }
             c.session_cursor = s.events.seq;
         }
+        if c.kind == "gui" {
+            let count = self
+                .sessions
+                .values()
+                .map(|s| {
+                    s.resource_leases
+                        .values()
+                        .filter(|(owner, _)| owner == client)
+                        .count()
+                })
+                .sum::<usize>();
+            events
+                .push(json!({"event":"native","kind":"session_usage","data":{"resources":count}}));
+        }
         Ok(json!({"events":events}))
     }
     pub fn gui_command(&mut self, client: &str, command: &Value) -> Result<Value> {
@@ -513,13 +763,14 @@ impl Hub {
                     c.pending
                         .push(json!({"event":"connected","generation":generation}));
                 }
-                for (setting, op) in [
-                    ("audio", "audio"),
-                    ("clipboard", "clipboard_enabled"),
-                    ("drag_receive", "drag_receive"),
-                ] {
+                for (setting, op) in [("audio", "audio"), ("drag_receive", "drag_receive")] {
                     s.send(json!({"op":op,"enabled":command["settings"][setting],"directory":command["settings"]["download_dir"]}))?;
                 }
+                self.sessions
+                    .get_mut(&id)
+                    .unwrap()
+                    .media_owners
+                    .insert("audio".into(), client.into());
                 self.video(client, &id, command["settings"]["wait_for_video"] == true)?;
             }
             "disconnect" | "quit" => {
@@ -537,10 +788,15 @@ impl Hub {
                     return Ok(json!({}));
                 };
                 ensure!(command["generation"] == generation, "旧会话输入已拒绝");
-                let input = &command["command"];
-                let op = input["op"].as_str().unwrap_or("");
+                let mut input = command["command"].clone();
+                let op_name = input["op"].as_str().unwrap_or("").to_owned();
+                let op = op_name.as_str();
                 if op == "expect_video" {
                     self.video(client, &id, input["enabled"] == true)?;
+                    return Ok(json!({"accepted":true}));
+                }
+                if matches!(op, "clipboard_focus" | "clipboard_enabled") {
+                    self.clipboard_focus(client, &id, input["enabled"] == true)?;
                     return Ok(json!({"accepted":true}));
                 }
                 let s = self.sessions.get_mut(&id).context("会话已结束")?;
@@ -557,7 +813,10 @@ impl Hub {
                             s.shell.as_ref().is_none_or(|t| t.closed),
                             "终端已被 MCP 使用"
                         );
-                        s.shell = Some(Shell::new(client));
+                        let terminal = Shell::new(client);
+                        s.resource_leases
+                            .insert(terminal.id.clone(), (client.into(), "terminal".into()));
+                        s.shell = Some(terminal);
                     } else {
                         ensure!(
                             s.shell.as_ref().is_some_and(|t| t.owner == client),
@@ -565,7 +824,13 @@ impl Hub {
                         );
                     }
                 }
-                if input_action(op) {
+                if matches!(op, "audio" | "microphone") {
+                    s.media_owners.insert(op.into(), client.into());
+                }
+                if input_action(op)
+                    || (op == "clipboard_files"
+                        && (input["drop"].is_object() || input["paste"] == true))
+                {
                     if s.input_owner
                         .as_deref()
                         .is_some_and(|owner| owner != client)
@@ -584,7 +849,58 @@ impl Hub {
                         s.ports.remove(&port);
                     }
                 }
-                s.send(input.clone())?;
+                let mut admitted = Vec::new();
+                if op == "terminal"
+                    && input["action"] == "open"
+                    && let Some(terminal) = &s.shell
+                {
+                    admitted.push(terminal.id.clone());
+                }
+                if op == "clipboard_files" {
+                    let transfer =
+                        -(((uuid::Uuid::new_v4().as_u128() as u32) & 0x1fff_ffff).max(1000) as i32);
+                    input["queued_id"] = json!(transfer);
+                    let lease = format!("gui-transfer:{transfer}");
+                    s.resource_leases
+                        .insert(lease.clone(), (client.into(), "transfer".into()));
+                    admitted.push(lease);
+                }
+                if op == "transfer_batch"
+                    && let Some(items) = input["items"].as_array_mut()
+                {
+                    for item in items {
+                        let transfer =
+                            ((uuid::Uuid::new_v4().as_u128() as u32) & 0x3fff_ffff).max(1000);
+                        item["queued_id"] = json!(transfer);
+                        let lease = format!("gui-transfer:{transfer}");
+                        s.resource_leases
+                            .insert(lease.clone(), (client.into(), "transfer".into()));
+                        admitted.push(lease);
+                    }
+                }
+                if op == "port_mapping"
+                    && let Some(port) = input["id"].as_u64()
+                {
+                    let lease = format!("port:{port}");
+                    if input["enabled"] == true {
+                        s.resource_leases
+                            .insert(lease.clone(), (client.into(), "port".into()));
+                        admitted.push(lease);
+                    } else {
+                        s.resource_leases.remove(&lease);
+                    }
+                }
+                if !admitted.is_empty() {
+                    let request = uid();
+                    input["client_request"] = json!(request);
+                    s.admissions.insert(request, admitted.clone());
+                }
+                if let Err(error) = s.send(input.clone()) {
+                    for lease in admitted {
+                        s.resource_leases.remove(&lease);
+                    }
+                    return Err(error);
+                }
             }
             "login" | "logout" => {
                 ensure!(
@@ -609,6 +925,7 @@ pub fn input_action(op: &str) -> bool {
         "up",
         "move",
         "relative",
+        "touch",
         "button_down",
         "button_up",
         "click",
@@ -711,6 +1028,26 @@ fn serve(mut stream: UnixStream, hub: Shared) -> Result<()> {
         let c = h.clients.get_mut(client).context("客户端不存在")?;
         c.last_seen = Instant::now();
     }
+    if request["op"] == "media" {
+        let client = client.to_owned();
+        let mut request = request.clone();
+        loop {
+            match crate::streams::read(&hub, &client, &request["arguments"]) {
+                Ok((metadata, samples)) => {
+                    ipc::write(&mut stream, &metadata)?;
+                    for sample in samples {
+                        stream.write_all(&sample.data)?;
+                    }
+                }
+                Err(e) => ipc::write(&mut stream, &json!({"_ipc_error":e.to_string()}))?,
+            }
+            request = ipc::read(&mut stream)?;
+            ensure!(
+                request["op"] == "media" && request["client_id"] == client,
+                "媒体连接请求不匹配"
+            );
+        }
+    }
     if request["op"] == "frame" {
         let client = client.to_owned();
         let mut request = request.clone();
@@ -729,7 +1066,7 @@ fn serve(mut stream: UnixStream, hub: Shared) -> Result<()> {
             {
                 ipc::write(
                     &mut stream,
-                    &json!({"frame":true,"width":frame.width,"height":frame.height,"sequence":frame.sequence,"generation":generation,"assembled_age_us":frame.assembled_at.elapsed().as_micros() as u64,"decoded_age_us":frame.decoded_at.elapsed().as_micros() as u64}),
+                    &json!({"frame":true,"geometry":frame.geometry,"width":frame.width,"height":frame.height,"sequence":frame.sequence,"generation":generation,"assembled_age_us":frame.assembled_at.elapsed().as_micros() as u64,"decoded_age_us":frame.decoded_at.elapsed().as_micros() as u64}),
                 )?;
                 stream.write_all(&frame.rgba)?;
             } else {
@@ -780,6 +1117,9 @@ mod tests {
                 ended: false,
                 closing: false,
                 video_owners: HashSet::new(),
+                media_owners: HashMap::new(),
+                resource_leases: HashMap::new(),
+                admissions: HashMap::new(),
                 phase: "ready".into(),
                 events: Default::default(),
                 snapshot: HashMap::new(),
@@ -792,6 +1132,29 @@ mod tests {
             },
         );
         (dir, h, rx)
+    }
+    #[test]
+    fn clipboard_focus_is_exclusive_and_a_previous_window_cannot_release_it() {
+        let (_dir, mut h, mut commands) = fixture();
+        let a = h.register("gui").unwrap();
+        let b = h.register("gui").unwrap();
+        h.open(&a, &json!({"device_id":"device"})).unwrap();
+        h.open(&b, &json!({"device_id":"device"})).unwrap();
+        while commands.try_recv().is_ok() {}
+        h.clipboard_focus(&a, "session", true).unwrap();
+        h.clipboard_focus(&b, "session", true).unwrap();
+        h.clipboard_focus(&a, "session", false).unwrap();
+        assert_eq!(h.clipboard_owner, Some(("session".into(), b.clone())));
+        let sent = std::iter::from_fn(|| commands.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(
+            sent.iter()
+                .map(|c| c["command"]["enabled"].clone())
+                .collect::<Vec<_>>(),
+            vec![json!(true), json!(false), json!(true)]
+        );
+        h.remove_client(&a);
+        assert_eq!(h.clipboard_owner, Some(("session".into(), b)));
     }
     #[test]
     fn gui_and_two_mcp_clients_reuse_connection_until_last_lease_leaves() {
@@ -850,6 +1213,7 @@ mod tests {
                 result: Value::Null,
                 error: None,
                 cancelled: false,
+                paused: false,
                 created: 0,
                 updated: 0,
                 transfer_ids: vec![1234],
@@ -932,6 +1296,36 @@ mod tests {
         assert!(h.ready(&client, "session-two").is_ok());
     }
     #[test]
+    fn explicit_detach_keeps_independent_task_and_stream_leases() {
+        let (_dir, mut h, mut commands) = fixture();
+        let client = h.register("mcp").unwrap();
+        h.open(&client, &json!({"device_id":"device"})).unwrap();
+        h.retain_resource(&client, "session", "job", "task")
+            .unwrap();
+        h.retain_resource(&client, "session", "stream", "stream")
+            .unwrap();
+        h.release(&client, "session");
+        assert!(!h.clients[&client].sessions.contains("session"));
+        assert!(h.ready(&client, "session").is_ok());
+        h.release_resource("session", "job");
+        assert!(!h.sessions["session"].closing);
+        assert!(!std::iter::from_fn(|| commands.try_recv().ok()).any(|v| v["op"] == "disconnect"));
+        h.release_resource("session", "stream");
+        assert!(h.sessions["session"].closing);
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|v| v["op"] == "disconnect"));
+    }
+    #[test]
+    fn status_sections_are_selective_and_unknown_names_are_errors() {
+        let (_dir, h, _) = fixture();
+        let s = &h.sessions["session"];
+        let status =
+            crate::capabilities::session_status(s, &json!({"include":["display","leases"]}))
+                .unwrap();
+        assert!(status.get("display").is_some());
+        assert!(status.get("performance").is_none());
+        assert!(crate::capabilities::session_status(s, &json!({"include":["typo"]})).is_err());
+    }
+    #[test]
     fn journal_is_bounded_and_reports_cursor_expiration() {
         let mut events = Journal::default();
         for i in 0..1500 {
@@ -940,5 +1334,57 @@ mod tests {
         assert!(events.rows.len() <= 1024);
         assert!(events.oldest() > 1);
         assert!(events.since(1499).len() == 1);
+    }
+    #[test]
+    fn binary_media_socket_keeps_frame_boundaries_and_independent_leases() {
+        let (_dir, mut h, _commands) = fixture();
+        let client = h.register("mcp").unwrap();
+        let peer = h.register("mcp").unwrap();
+        h.open(&client, &json!({"device_id":"device"})).unwrap();
+        h.open(&peer, &json!({"device_id":"device"})).unwrap();
+        let bus = h.sessions["session"].backend.media.clone();
+        bus.screen(7);
+        bus.video(
+            bytes::Bytes::from_static(&[0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3]),
+            0,
+            1,
+            0,
+            "h264",
+        );
+        let h = Arc::new(Mutex::new(h));
+        let opened = crate::streams::open(
+            &h,
+            &client,
+            &json!({"session_id":"session","screen_id":7,"tracks":["video"]}),
+        )
+        .unwrap();
+        assert!(
+            crate::streams::read_json(
+                &h,
+                &peer,
+                &json!({"stream_id":opened["stream_id"],"cursor":opened["cursor"]})
+            )
+            .is_err()
+        );
+        h.lock().unwrap().release(&client, "session");
+        let (mut local, remote) = UnixStream::pair().unwrap();
+        let server = h.clone();
+        let worker = std::thread::spawn(move || serve(remote, server));
+        let mut request = json!({"op":"media","client_id":client,"arguments":{"stream_id":opened["stream_id"],"cursor":opened["cursor"]}});
+        ipc::write(&mut local, &request).unwrap();
+        let metadata = ipc::read(&mut local).unwrap();
+        let entries = metadata["samples"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0]["data_base64"].is_null());
+        let mut payload = vec![0; entries[0]["size"].as_u64().unwrap() as usize];
+        local.read_exact(&mut payload).unwrap();
+        assert!(payload.starts_with(&[0, 0, 0, 1, 0x67]));
+        request["arguments"]["cursor"] = metadata["next_cursor"].clone();
+        ipc::write(&mut local, &request).unwrap();
+        assert_eq!(ipc::read(&mut local).unwrap()["samples"], json!([]));
+        drop(local);
+        assert!(worker.join().unwrap().is_err());
+        crate::streams::close(&h, &client, &json!({"stream_id":opened["stream_id"]})).unwrap();
+        assert!(h.lock().unwrap().ready(&peer, "session").is_ok());
     }
 }

@@ -1,5 +1,7 @@
 mod app;
 mod backend;
+mod brand;
+mod capabilities;
 mod capture_state;
 mod core;
 mod diagnostic_io;
@@ -10,10 +12,13 @@ mod ipc;
 mod live_test;
 mod mcp;
 mod mcp_api;
+mod media_bus;
 mod perf;
 mod platform;
 mod preferences_store;
 mod service;
+mod stream_decode;
+mod streams;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -177,6 +182,7 @@ fn main() -> eframe::Result {
             .with_inner_size([920.0, 680.0])
             .with_min_inner_size([860.0, 600.0])
             .with_decorations(false)
+            .with_icon(brand::icon())
             .with_active(opts.screenshot.is_none() || opts.diagnostic_stdin)
             .with_app_id("uux"),
         renderer: eframe::Renderer::Glow,

@@ -1,4 +1,4 @@
-//! Keep RPC acceptance separate from observing a frame at the requested size.
+//! Keep RPC replies separate from observing the requested desktop/video size.
 #[derive(Default)]
 pub struct CaptureState {
     token: u64,
@@ -40,11 +40,13 @@ impl CaptureState {
         if pending.request_id != Some(request_id) {
             return None;
         }
-        if !accepted {
-            self.pending = None;
-            return Some("远端未接受参数修改".into());
-        }
+        // A composite capture reply can contain errors for ancillary options
+        // while the requested display mode has already changed on the host.
         pending.accepted = true;
+        if !accepted && pending.target.is_none() {
+            self.pending = None;
+            return Some("远端报告部分参数失败，请检查实际状态".into());
+        }
         if let Some(target) = pending.target
             && target != size
         {
@@ -52,12 +54,26 @@ impl CaptureState {
                 return Some(display_confirmed(target, size));
             }
             return Some(format!(
-                "远端已接受，正在等待 {} × {} 画面",
-                target[0], target[1]
+                "{}，正在等待 {} × {} 画面",
+                if accepted {
+                    "远端已接受"
+                } else {
+                    "远端报告部分参数失败"
+                },
+                target[0],
+                target[1]
             ));
         }
+        let resolution = pending.target.is_some();
         self.pending = None;
-        Some("远端参数已更新".into())
+        Some(
+            if resolution {
+                "远端画面尺寸已更新"
+            } else {
+                "远端已确认请求，效果以实际状态为准"
+            }
+            .into(),
+        )
     }
     /// Screen geometry is the desktop mode, not necessarily the encoded size.
     /// Keep waiting for exact-size video separately, but never describe a
@@ -146,12 +162,31 @@ mod tests {
         assert!(!state.observe_frame([1280, 720]));
         assert_eq!(
             state.acknowledge(31, true, [1280, 720]).as_deref(),
-            Some("远端参数已更新")
+            Some("远端画面尺寸已更新")
         );
         let token = state.begin([1600, 900], 1);
         state.submitted(token, 33);
         state.clear();
         assert!(state.acknowledge(33, true, [1280, 720]).is_none());
+    }
+    #[test]
+    fn partial_error_does_not_hide_observed_resolution_change() {
+        let mut state = CaptureState::default();
+        let token = state.begin([1280, 720], 1);
+        state.submitted(token, 31);
+        assert!(
+            state
+                .acknowledge(31, false, [1920, 1080])
+                .unwrap()
+                .contains("部分参数失败")
+        );
+        assert!(
+            state
+                .observe_screen(1, [1280, 720], [1280, 720])
+                .unwrap()
+                .contains("已更新")
+        );
+        assert!(state.observe_frame([1280, 720]));
     }
     #[test]
     fn scaled_video_does_not_hide_confirmed_desktop_mode() {

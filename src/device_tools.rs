@@ -49,6 +49,7 @@ impl Desktop {
         }
     }
     pub(super) fn device_menu(&mut self, ui: &mut egui::Ui, device: &Device) {
+        menu_layout(ui);
         let available = self.ui_state.device_tools.pending.is_none();
         let idle = !self.connected && !self.connecting && !self.disconnecting;
         let same = self
@@ -57,7 +58,7 @@ impl Desktop {
             .is_some_and(|d| d.id == device.id);
         ui.add_enabled_ui(available, |ui| {
             if ui
-                .add_enabled_ui(device.online && (idle || same), |ui| {
+                .add_enabled_ui(device.online, |ui| {
                     menu_item(ui, Icon::Transfer, "端口映射")
                 })
                 .inner
@@ -67,9 +68,7 @@ impl Desktop {
                 ui.close();
             }
             if ui
-                .add_enabled_ui(device.online && (idle || same), |ui| {
-                    menu_item(ui, Icon::Terminal, "终端")
-                })
+                .add_enabled_ui(device.online, |ui| menu_item(ui, Icon::Terminal, "终端"))
                 .inner
                 .clicked()
             {
@@ -77,13 +76,19 @@ impl Desktop {
                 ui.close();
             }
             for (action, title, icon) in [
+                ("wake", "远程开机", Icon::Power),
                 ("shutdown", "关机", Icon::Power),
                 ("reboot", "重启", Icon::Refresh),
             ] {
                 if ui
-                    .add_enabled_ui(device.online && (idle || same), |ui| {
-                        menu_item(ui, icon, title)
-                    })
+                    .add_enabled_ui(
+                        if action == "wake" {
+                            !device.online
+                        } else {
+                            device.online && (idle || same)
+                        },
+                        |ui| menu_item(ui, icon, title),
+                    )
                     .inner
                     .clicked()
                 {
@@ -130,134 +135,134 @@ impl Desktop {
         let busy = self.ui_state.device_tools.pending.is_some();
         let mut submit = false;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::unique("device-action-dialog"))
-            .backdrop_color(Color32::from_black_alpha(90))
-            .frame(egui::Frame::new().fill(Color32::WHITE).corner_radius(8))
-            .show(ctx, |ui| {
-                ui.set_width(446.0);
-                ui.spacing_mut().item_spacing = Vec2::ZERO;
-                egui::Frame::new().inner_margin(24).show(ui, |ui| {
-                    ui.set_width(398.0);
-                    ui.spacing_mut().item_spacing.y = 12.0;
-                    match &mut dialog {
-                        Dialog::Rename { name, focus, .. } => {
-                            ui.label(RichText::new("修改设备名称").size(16.0));
-                            let text = ui.add_sized(
-                                [398.0, 32.0],
-                                singleline(name).char_limit(40).margin(egui::Margin {
-                                    left: 8,
-                                    right: 32,
-                                    top: 5,
-                                    bottom: 5,
-                                }),
-                            );
-                            if !*focus {
-                                text.request_focus();
-                                if let Some(mut state) = egui::TextEdit::load_state(ctx, text.id) {
-                                    state.cursor.set_char_range(Some(
-                                        egui::text::CCursorRange::two(
-                                            egui::text::CCursor::new(0),
-                                            egui::text::CCursor::new(name.chars().count()),
-                                        ),
-                                    ));
-                                    state.store(ctx, text.id);
-                                }
-                                *focus = true;
+        let response = modal(ctx, "device-action-dialog", |ui| {
+            ui.set_width(446.0);
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            egui::Frame::new().inner_margin(24).show(ui, |ui| {
+                ui.set_width(398.0);
+                ui.spacing_mut().item_spacing.y = 12.0;
+                match &mut dialog {
+                    Dialog::Rename { name, focus, .. } => {
+                        ui.label(RichText::new("修改设备名称").size(16.0));
+                        let text = ui.add_sized(
+                            [398.0, 32.0],
+                            singleline(name).char_limit(40).margin(egui::Margin {
+                                left: 8,
+                                right: 32,
+                                top: 5,
+                                bottom: 5,
+                            }),
+                        );
+                        if !*focus {
+                            text.request_focus();
+                            if let Some(mut state) = egui::TextEdit::load_state(ctx, text.id) {
+                                state
+                                    .cursor
+                                    .set_char_range(Some(egui::text::CCursorRange::two(
+                                        egui::text::CCursor::new(0),
+                                        egui::text::CCursor::new(name.chars().count()),
+                                    )));
+                                state.store(ctx, text.id);
                             }
-                            let clear = egui::Rect::from_center_size(
-                                text.rect.right_center() - Vec2::new(14.0, 0.0),
-                                Vec2::splat(22.0),
-                            );
-                            // The field retains normal text selection; clearing is a separate control.
-                            text.on_hover_text("最多可输入 40 个字符");
-                            if ui
-                                .place(clear, egui::Button::new("×").frame(false))
-                                .clicked()
-                            {
-                                name.clear();
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("最多可输入40个字符").size(12.0).color(MUTED),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(format!("{}/40", name.chars().count()))
-                                                .size(12.0)
-                                                .color(MUTED),
-                                        );
-                                    },
-                                );
-                            });
+                            *focus = true;
                         }
-                        Dialog::Confirm {
-                            device,
-                            title,
-                            action,
-                            ..
-                        } => {
-                            ui.label(RichText::new(*title).size(16.0));
-                            ui.label(if *action == "remove" {
-                                format!("确定要从设备列表中删除 {} 吗？", device.name)
-                            } else {
-                                format!(
-                                    "确定要{} {} 吗？当前远控连接将中断，请先保存远端工作。",
-                                    title, device.name
-                                )
-                            });
+                        let clear = egui::Rect::from_center_size(
+                            text.rect.right_center() - Vec2::new(14.0, 0.0),
+                            Vec2::splat(22.0),
+                        );
+                        // The field retains normal text selection; clearing is a separate control.
+                        text.on_hover_text("最多可输入 40 个字符");
+                        if ui
+                            .place(clear, egui::Button::new("×").frame(false))
+                            .clicked()
+                        {
+                            name.clear();
                         }
-                    }
-                    if let Some(message) = &self.ui_state.device_tools.error {
-                        ui.colored_label(Color32::from_rgb(200, 60, 60), message);
-                    }
-                    if busy {
                         ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在处理…");
+                            ui.label(RichText::new("最多可输入40个字符").size(12.0).color(MUTED));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{}/40", name.chars().count()))
+                                            .size(12.0)
+                                            .color(MUTED),
+                                    );
+                                },
+                            );
                         });
                     }
-                });
-                egui::Frame::new()
-                    .fill(BG)
-                    .corner_radius(egui::CornerRadius {
-                        nw: 0,
-                        ne: 0,
-                        sw: 8,
-                        se: 8,
-                    })
-                    .inner_margin(24)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let valid = match &dialog {
-                            Dialog::Rename { name, .. } => !name.trim().is_empty(),
-                            _ => true,
-                        };
-                        ui.horizontal(|ui| {
-                            submit = ui
-                                .add_enabled_ui(!busy && valid, |ui| {
-                                    art::primary(
-                                        ui,
-                                        if matches!(dialog, Dialog::Rename { .. }) {
-                                            "保存更改"
-                                        } else {
-                                            "确定"
-                                        },
-                                        Vec2::new(195.0, 32.0),
-                                    )
-                                })
-                                .inner
-                                .clicked();
-                            cancel = ui
-                                .add_enabled(
-                                    !busy,
-                                    egui::Button::new("取消").min_size(Vec2::new(195.0, 32.0)),
-                                )
-                                .clicked();
+                    Dialog::Confirm {
+                        device,
+                        title,
+                        action,
+                        ..
+                    } => {
+                        ui.label(RichText::new(*title).size(16.0));
+                        ui.label(if *action == "remove" {
+                            format!("确定要从设备列表中删除 {} 吗？", device.name)
+                        } else if *action == "wake" {
+                            format!(
+                                "通过官方远程开机配置唤醒 {}。请求提交后，请等待设备上线。",
+                                device.name
+                            )
+                        } else {
+                            format!(
+                                "确定要{} {} 吗？当前远控连接将中断，请先保存远端工作。",
+                                title, device.name
+                            )
                         });
+                    }
+                }
+                if let Some(message) = &self.ui_state.device_tools.error {
+                    ui.colored_label(Color32::from_rgb(200, 60, 60), message);
+                }
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在处理…");
                     });
+                }
             });
+            egui::Frame::new()
+                .fill(BG)
+                .corner_radius(egui::CornerRadius {
+                    nw: 0,
+                    ne: 0,
+                    sw: 8,
+                    se: 8,
+                })
+                .inner_margin(24)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    let valid = match &dialog {
+                        Dialog::Rename { name, .. } => !name.trim().is_empty(),
+                        _ => true,
+                    };
+                    ui.horizontal(|ui| {
+                        submit = ui
+                            .add_enabled_ui(!busy && valid, |ui| {
+                                art::primary(
+                                    ui,
+                                    if matches!(dialog, Dialog::Rename { .. }) {
+                                        "保存更改"
+                                    } else {
+                                        "确定"
+                                    },
+                                    Vec2::new(195.0, 32.0),
+                                )
+                            })
+                            .inner
+                            .clicked();
+                        cancel = ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new("取消").min_size(Vec2::new(195.0, 32.0)),
+                            )
+                            .clicked();
+                    });
+                });
+        });
         if submit {
             let (device, action, name) = match &dialog {
                 Dialog::Rename { device, name, .. } => {

@@ -7,6 +7,7 @@ use super::{
 };
 use crate::backend::{Event, VideoFrame};
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine;
 use bytes::Bytes;
 use prost::Message;
 use serde_json::{Value, json};
@@ -111,6 +112,7 @@ mod startup_tests {
 
 #[derive(Clone)]
 pub struct Output {
+    pub media: Arc<crate::media_bus::MediaBus>,
     pub generation: Option<u64>,
     pub events: stdmpsc::Sender<Event>,
     pub latest: Arc<Mutex<Option<VideoFrame>>>,
@@ -142,6 +144,10 @@ pub struct Session {
     files: super::files::Files,
     super_screen: super::super_screen::SuperScreen,
     drag_files: super::drag_files::DragFiles,
+    file_offer: Option<super::clipboard_files::FileOffer>,
+    clipboard_files_pending: Option<(u32, Arc<tempfile::TempDir>)>,
+    clipboard_cache_count: usize,
+    clipboard_cache_bytes: u64,
     drag_receive: bool,
     download_dir: std::path::PathBuf,
     generation: u64,
@@ -159,18 +165,29 @@ pub struct Session {
     recovered: Arc<std::sync::atomic::AtomicU64>,
     metrics: Arc<Metrics>,
     audio: Option<media::Audio>,
+    microphone: Option<super::microphone::Microphone>,
+    microphone_transceiver: Option<Arc<webrtc::rtp_transceiver::RTCRtpTransceiver>>,
+    microphone_pending: Option<(i64, bool, Instant)>,
+    audio_subscription: bool,
+    capture_requested: Value,
+    remote_streamer: Value,
+    virtual_displays: super::virtual_display::VirtualDisplays,
     clipboard: Option<super::clipboard::Clipboard>,
     clipboard_enabled: bool,
     clipboard_observe: bool,
+    clipboard_offer: Option<i64>,
+    clipboard_paste_offer: Option<i64>,
     files_allowed: bool,
     assistance: bool,
     inhibitor: Option<crate::platform::Inhibitor>,
     lock_on_disconnect: bool,
     local_files_allowed: bool,
     read_only: bool,
-    clipboard_wire: super::clipboard_wire::TextClipboard,
+    clipboard_wire: super::clipboard_wire::ClipboardData,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    touches: BTreeSet<u32>,
+    touch_supported: Option<bool>,
     pending_candidates: Vec<RTCIceCandidateInit>,
     answered: bool,
     started: Instant,
@@ -216,9 +233,18 @@ impl Session {
             recovered: Default::default(),
             metrics: Arc::new(Metrics::default()),
             audio: None,
+            microphone: None,
+            microphone_transceiver: None,
+            microphone_pending: None,
+            audio_subscription: false,
+            capture_requested: json!({}),
+            remote_streamer: Value::Null,
+            virtual_displays: Default::default(),
             clipboard: None,
             clipboard_enabled: true,
             clipboard_observe: false,
+            clipboard_offer: None,
+            clipboard_paste_offer: None,
             files_allowed: true,
             assistance: false,
             inhibitor: None,
@@ -227,10 +253,16 @@ impl Session {
             read_only: false,
             clipboard_wire: Default::default(),
             drag_files: Default::default(),
+            clipboard_files_pending: None,
+            clipboard_cache_count: 0,
+            clipboard_cache_bytes: 0,
+            file_offer: None,
             drag_receive: false,
             download_dir: Default::default(),
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            touches: BTreeSet::new(),
+            touch_supported: None,
             pending_candidates: vec![],
             answered: false,
             started: Instant::now(),
@@ -310,6 +342,13 @@ impl Session {
         self.local_files_allowed = settings["allow_files"].as_bool().unwrap_or(true);
         self.read_only = settings["read_only"].as_bool().unwrap_or(false);
         self.screen_preference = settings["super_screen"].as_bool();
+        self.capture_requested = settings.clone();
+        if let Some(preference) = settings["decoder_preference"]
+            .as_str()
+            .filter(|p| super::decoder::preferences().contains(p))
+        {
+            *self.output.media.decoder_preference.lock().unwrap() = preference.into();
+        }
         self.video_visible = settings["wait_for_video"].as_bool().unwrap_or(true);
         if settings["startup_capture_recovery"] == false {
             self.startup_recovery.disable();
@@ -412,6 +451,10 @@ impl Session {
                 }),
             );
         }
+        self.output.native(
+            "remote_streamer",
+            crate::perf::streamer_capabilities(result["streamer_data"].as_str().unwrap_or("")),
+        );
         self.ice = result["ice_id"].as_str().context("缺少 ICE 标识")?.into();
         self.remote = result["client_id"].as_str().context("缺少远端标识")?.into();
         self.phase("control_accepted");
@@ -465,6 +508,15 @@ impl Session {
         for (mime, pt, fmt, rate, channels, kind) in [
             ("video/H264", 102, h264_fmtp, 90000, 0, RTPCodecType::Video),
             ("video/rtx", 103, "apt=102", 90000, 0, RTPCodecType::Video),
+            (
+                "video/H265",
+                104,
+                "profile-id=1;sprop-max-don-diff=0",
+                90000,
+                0,
+                RTPCodecType::Video,
+            ),
+            ("video/rtx", 105, "apt=104", 90000, 0, RTPCodecType::Video),
             (
                 "audio/opus",
                 111,
@@ -603,17 +655,25 @@ impl Session {
             self.output.latest.clone(),
             self.metrics.clone(),
             self.output.ctx.clone(),
+            self.output.media.clone(),
         );
         let audio = media::Audio::start(self.metrics.clone());
         audio.enabled.store(
             settings["audio"].as_bool().unwrap_or(true),
             Ordering::Relaxed,
         );
+        if let Some(id) = settings["output_device"]
+            .as_str()
+            .filter(|id| *id != "default")
+        {
+            *audio.device.lock().unwrap() = Some(id.to_owned());
+        }
         let audio_packets = audio.packets.clone();
         self.audio = Some(audio);
         let metrics = self.metrics.clone();
         let cancel = self.cancel.clone();
         let peer = Arc::downgrade(&pc);
+        let media_bus = self.output.media.clone();
         tokio::spawn(async move {
             let mut assembler = H264Assembler::default();
             let mut interval = tokio::time::interval(Duration::from_millis(20));
@@ -687,8 +747,16 @@ impl Session {
                     if metrics.samples.fetch_add(1, Ordering::Relaxed) == 0 {
                         crate::perf::trace("media_start", json!({"stage":"video_access_unit"}));
                     }
+                    let geometry = media_bus.video(
+                        frame.data.clone(),
+                        frame.rtp_timestamp,
+                        frame.rtp_ssrc,
+                        frame.losses,
+                        frame.codec,
+                    );
                     if video
                         .try_send(media::EncodedFrame {
+                            geometry,
                             unit: frame,
                             queue_loss: metrics.queue_drops.load(Ordering::Relaxed),
                         })
@@ -710,10 +778,14 @@ impl Session {
                 } else {
                     primary_ssrc.load(Ordering::Relaxed)
                 };
-                if (loss > last_loss || metrics.decoded.load(Ordering::Relaxed) == 0 || stale)
+                if (loss > last_loss
+                    || metrics.decoded.load(Ordering::Relaxed) == 0
+                    || stale
+                    || media_bus.request_keyframe.load(Ordering::Relaxed))
                     && pli_ssrc != 0
                     && last_pli.elapsed() > Duration::from_millis(500)
                 {
+                    media_bus.request_keyframe.store(false, Ordering::Relaxed);
                     metrics.pli.fetch_add(1, Ordering::Relaxed);
                     last_loss = loss;
                     last_pli = Instant::now();
@@ -739,11 +811,14 @@ impl Session {
         });
         let cancel = self.cancel.clone();
         let report_metrics = self.metrics.clone();
+        let media_bus = self.output.media.clone();
         pc.on_track(Box::new(move|track,receiver,_|{
             let audio=audio_packets.clone();let cancel=cancel.clone();
             let metrics = report_metrics.clone();
+            let media_bus=media_bus.clone();
             Box::pin(async move {
                 let report_cancel = cancel.clone();
+                let report_media=media_bus.clone();
                 // on_track runs after the receiver has installed its streams.
                 // Starting this before negotiation races the empty track list.
                 tokio::spawn(async move {
@@ -756,6 +831,7 @@ impl Session {
                             },
                         };
                         metrics.rtcp_packets.fetch_add(packets.len() as u64, Ordering::Relaxed);
+                        for packet in packets {if let Some(report)=packet.as_any().downcast_ref::<webrtc::rtcp::sender_report::SenderReport>() {report_media.sender_report(report.ssrc,report.rtp_time,report.ntp_time);}}
                     }
                 });
                 tokio::spawn(async move {
@@ -763,13 +839,33 @@ impl Session {
                         // read_rtp is not cancellation safe. Cancel only when closing.
                         let result=tokio::select!{_=cancel.cancelled()=>break,result=track.read_rtp()=>result};
                         let Ok((packet,_))=result else{break};
-                        if track.kind()==RTPCodecType::Audio {let _=audio.try_send(packet.payload);}
+                        if track.kind()==RTPCodecType::Audio {media_bus.audio(packet.payload.clone(),packet.header.timestamp,packet.header.ssrc);let _=audio.try_send(packet.payload);}
                     }
                 });
             })
         }));
         for kind in [RTPCodecType::Video, RTPCodecType::Audio] {
             if kind == RTPCodecType::Audio && settings["video_only"] == true {
+                continue;
+            }
+            if kind == RTPCodecType::Audio && settings["microphone_track"] != false {
+                let track = Arc::new(webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample::new(
+                    RTCRtpCodecCapability { mime_type: "audio/opus".into(), clock_rate:48000, channels:2, sdp_fmtp_line:"minptime=10;useinbandfec=1".into(), ..Default::default() },
+                    "microphone".into(), "uux".into()));
+                let transceiver = pc
+                    .add_transceiver_from_track(
+                        track.clone(),
+                        Some(RTCRtpTransceiverInit {
+                            direction: RTCRtpTransceiverDirection::Sendrecv,
+                            send_encodings: vec![],
+                        }),
+                    )
+                    .await?;
+                self.microphone_transceiver = Some(transceiver);
+                self.microphone = Some(super::microphone::Microphone::start(
+                    track,
+                    self.cancel.clone(),
+                ));
                 continue;
             }
             pc.add_transceiver_from_kind(
@@ -933,6 +1029,10 @@ impl Session {
         Ok(())
     }
     async fn signal_event(&mut self, event: signal::Event) -> Result<()> {
+        if let Some(caps) = signal::forwarded_capabilities(&event, &self.remote, &self.ice) {
+            self.remote_streamer = caps.clone();
+            self.output.native("remote_streamer", caps);
+        }
         if event.name != "soac" && std::env::var_os("UU_PERF_LOG").is_some() {
             let name = match event.name.as_str() {
                 "streamer_push" => "streamer_push",
@@ -970,12 +1070,13 @@ impl Session {
                 }
             }
         }
-        if self.early_signal_handshake
-            && let Some(bytes) = signal::forwarded_app_data(&event, &self.remote, &self.ice)
+        if let Some(bytes) = signal::forwarded_app_data(&event, &self.remote, &self.ice)
             && let Ok(message) = pb::Message::decode(bytes)
         {
             match message.which {
-                Some(pb::message::Which::SimpleAction(action)) if action.action == 0 => {
+                Some(pb::message::Which::SimpleAction(action))
+                    if action.action == 0 && self.early_signal_handshake =>
+                {
                     self.send_signal_app(
                         pb::Message {
                             seq: message.seq,
@@ -992,12 +1093,22 @@ impl Session {
                     )
                     .await?;
                 }
-                Some(pb::message::Which::SimpleAction(action)) if action.action == 1 => {
+                Some(pb::message::Which::SimpleAction(action))
+                    if action.action == 1 && self.early_signal_handshake =>
+                {
+                    if let Some(pb::simple_action::Params::FeatureFlag(flags)) = action.params {
+                        self.output.native("remote_features", json!({"capture_setting":flags.ff_capture_setting,"simple_action":flags.ff_simple_action,"system_metrics":flags.ff_system_metrics,"clipboard":flags.ff_clipboard,"file_transfer":flags.ff_file_transfer_ftp,"file_transfer_v2":flags.ff_file_transfer_ftp2,"virtual_mouse":flags.ff_virtual_mouse_device}));
+                    }
                     // This confirms only the signaling route. The normal SCTP
                     // ECHO still establishes protocol_ready and the probe gate.
                     self.phase("signal_echo_received");
                 }
-                Some(pb::message::Which::Screens(_)) => {
+                Some(
+                    pb::message::Which::Screens(_)
+                    | pb::message::Which::CodecNegotiation(_)
+                    | pb::message::Which::SystemMetrics(_)
+                    | pb::message::Which::CaptureSettingSync(_),
+                ) => {
                     self.data("SIGNAL_APP_DATA", bytes).await?;
                 }
                 _ => {}
@@ -1036,6 +1147,7 @@ impl Session {
                     pc.add_ice_candidate(candidate).await?;
                 }
                 self.phase("answer_received");
+                self.audio_negotiation().await;
             }
             Some("candidate") => {
                 let candidate: RTCIceCandidateInit =
@@ -1054,10 +1166,21 @@ impl Session {
                 self.signal.as_ref().unwrap().emit("soac",vec![json!({"client_id":self.remote,"data":{
                     "ice_id":self.ice,"app_control_id":self.control_id,"type":"answer","sdp":wire::data_channel_limit(&answer.sdp),"ice_network_type":3
                 }})],vec![],false).await?;
+                self.audio_negotiation().await;
             }
             _ => {}
         }
         Ok(())
+    }
+    async fn audio_negotiation(&self) {
+        if let Some(pc) = &self.pc {
+            let tracks = pc.get_transceivers().await.into_iter()
+                .filter(|t| t.kind() == RTPCodecType::Audio)
+                .map(|t| json!({"offered":t.direction().to_string(),"negotiated":t.current_direction().to_string()}))
+                .collect::<Vec<_>>();
+            self.output
+                .native("audio_negotiation", json!({"tracks":tracks}));
+        }
     }
     async fn send_protobuf(&self, data: Vec<u8>) -> Result<()> {
         self.send_channel(self.protobuf_channel(), self.protobuf_text, data)
@@ -1254,6 +1377,40 @@ impl Session {
             }
             return Ok(());
         }
+        if let Some(id) = label.strip_prefix("CLIPBOARD_FILES_OFFER:") {
+            if let Some(offer) = &self.file_offer
+                && offer.active()
+                && Some(offer.id) == id.parse::<i32>().ok()
+            {
+                if !self.files_allowed || !self.local_files_allowed {
+                    offer.reject("文件传输权限已关闭");
+                } else if offer
+                    .geometry
+                    .is_some_and(|g| g != self.output.media.geometry())
+                    || (offer.geometry.is_some() && self.read_only)
+                {
+                    offer.reject("拖放画面已失效，请在当前屏幕重新拖放");
+                } else {
+                    self.send_file(data.to_vec()).await?;
+                    if let Some(offer) = &mut self.file_offer {
+                        offer.input_pending = offer.paste;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if let Some(id) = label.strip_prefix("CLIPBOARD_FILES_PACKET:") {
+            if self.files_allowed
+                && self.local_files_allowed
+                && self
+                    .file_offer
+                    .as_ref()
+                    .is_some_and(|f| f.active() && Some(f.id) == id.parse::<i32>().ok())
+            {
+                self.send_file(data.to_vec()).await?;
+            }
+            return Ok(());
+        }
         if label == "CLIPBOARD_APPLIED" {
             self.output.native(
                 "clipboard_applied",
@@ -1268,11 +1425,93 @@ impl Session {
             );
             return Ok(());
         }
+        if label == "LOCAL_CLIPBOARD_RESULT" {
+            self.output
+                .native("local_clipboard_result", serde_json::from_slice(data)?);
+            return Ok(());
+        }
+        if matches!(
+            label,
+            "LOCAL_CLIPBOARD"
+                | "LOCAL_CLIPBOARD_PASTE"
+                | "LOCAL_CLIPBOARD_IMAGE"
+                | "LOCAL_CLIPBOARD_IMAGE_PASTE"
+                | "LOCAL_CLIPBOARD_FILES"
+                | "LOCAL_CLIPBOARD_FILES_PASTE"
+        ) {
+            for packet in self.cancel_clipboard_files() {
+                self.send_file(packet).await?;
+            }
+        }
+        if let Some(id) = label.strip_prefix("CLIPBOARD_FILES_PASTE:") {
+            if self.clipboard_enabled
+                && !self.read_only
+                && self
+                    .file_offer
+                    .as_ref()
+                    .is_some_and(|f| f.active() && Some(f.id) == id.parse::<i32>().ok())
+            {
+                if let Some(offer) = &mut self.file_offer {
+                    offer.input_pending = false;
+                }
+                self.paste_keys().await?;
+            }
+            return Ok(());
+        }
+        if matches!(
+            label,
+            "LOCAL_CLIPBOARD_FILES_PASTE" | "LOCAL_CLIPBOARD_FILES"
+        ) {
+            if !self.clipboard_enabled
+                || (self.read_only && label == "LOCAL_CLIPBOARD_FILES_PASTE")
+                || !self.files_allowed
+                || !self.local_files_allowed
+            {
+                self.output.native(
+                    "clipboard_error",
+                    json!({"message":"当前会话未允许文件粘贴"}),
+                );
+                return Ok(());
+            }
+            let paths: Value = serde_json::from_slice(data)?;
+            let id = -(((uuid::Uuid::new_v4().as_u128() as u32) & 0x1fff_ffff).max(1000) as i32);
+            self.file_offer = None;
+            self.clipboard_wire.clear_offer();
+            match super::clipboard_files::FileOffer::start(
+                &json!({"paths":paths,"queued_id":id,"paste":label=="LOCAL_CLIPBOARD_FILES_PASTE"}),
+                self.output.clone(),
+                self.incoming_tx.clone(),
+            ) {
+                Ok(offer) => self.file_offer = Some(offer),
+                Err(e) => self
+                    .output
+                    .native("clipboard_error", json!({"message":e.to_string()})),
+            }
+            return Ok(());
+        }
+        if matches!(
+            label,
+            "LOCAL_CLIPBOARD_IMAGE" | "LOCAL_CLIPBOARD_IMAGE_PASTE"
+        ) {
+            if self.clipboard_enabled {
+                self.file_offer = None;
+                let (id, bytes) = self.clipboard_wire.offer_image(data)?;
+                self.send_file(bytes).await?;
+                self.clipboard_offer = Some(id);
+                self.clipboard_paste_offer = if label == "LOCAL_CLIPBOARD_IMAGE_PASTE" {
+                    Some(id)
+                } else {
+                    None
+                };
+            }
+            return Ok(());
+        }
         if label == "LOCAL_CLIPBOARD" || label == "LOCAL_CLIPBOARD_PASTE" {
             if (self.clipboard_enabled || label == "LOCAL_CLIPBOARD_PASTE")
                 && let Ok(text) = std::str::from_utf8(data)
             {
                 if self.clipboard_enabled {
+                    self.file_offer = None;
                     let (_, bytes) = wire::rpc(pb::rpc_request::Which::TextChangeRequest(
                         pb::ClipboardTextChangeRequest {
                             format_id: 13,
@@ -1280,6 +1519,7 @@ impl Session {
                         },
                     ));
                     self.send_protobuf(bytes).await?;
+                    self.clipboard_wire.clear_offer();
                 }
                 if label == "LOCAL_CLIPBOARD_PASTE" {
                     // Use the direct text path for local paste; it avoids a
@@ -1334,15 +1574,18 @@ impl Session {
         match message.which {
             Some(pb::message::Which::PortMappingFrame(frame)) => self.ports.receive(frame),
             Some(pb::message::Which::CodecNegotiation(capabilities)) => {
-                crate::perf::trace(
-                    "remote_encoder_capabilities",
-                    json!({
-                        "encoders":capabilities.encoder_cap_list.iter().take(32).map(|cap| json!({
-                            "capture_mode":cap.capture_mode,"fps":cap.fps,"codec_type":cap.corec_type,
-                            "width":cap.resolution_width,"height":cap.resolution_height
-                        })).collect::<Vec<_>>()
-                    }),
-                );
+                let data = json!({"encoders":capabilities.encoder_cap_list.iter().take(32).map(|cap| json!({
+                    "capture_mode":cap.capture_mode,"fps":cap.fps,"codec_type":cap.corec_type,
+                    "width":cap.resolution_width,"height":cap.resolution_height
+                })).collect::<Vec<_>>()});
+                crate::perf::trace("remote_encoder_capabilities", data.clone());
+                self.output.native("remote_encoders", data);
+            }
+            Some(pb::message::Which::SystemMetrics(metrics)) => {
+                if let Some(general) = metrics.general {
+                    self.touch_supported = Some(general.support_touch);
+                    self.output.native("remote_general", json!({"support_touch":general.support_touch,"system_sound_support":general.system_sound_support,"win_os_ver":general.win_os_ver}));
+                }
             }
             Some(pb::message::Which::ReportQosStats(stats)) => {
                 crate::perf::trace(
@@ -1355,7 +1598,7 @@ impl Session {
                 );
             }
             Some(pb::message::Which::CaptureSettingSync(settings)) => {
-                crate::perf::trace(
+                self.output.native(
                     "remote_capture",
                     json!({
                         "fps_enum":settings.fps,"quality":settings.frame_quality,
@@ -1364,7 +1607,7 @@ impl Session {
                         "chroma_format":settings.chroma_format,
                         "resolution_type":settings.resolution_type,
                         "pixel_width":settings.resolution_pixel_width,
-                        "pixel_height":settings.resolution_pixel_height
+                        "pixel_height":settings.resolution_pixel_height,"dpi":settings.dpi_scale
                     }),
                 );
             }
@@ -1401,15 +1644,32 @@ impl Session {
                 .await?
             }
             Some(pb::message::Which::SimpleAction(action)) if action.action == 1 => {
+                if let Some(pb::simple_action::Params::FeatureFlag(flags)) = action.params {
+                    self.output.native("remote_features", json!({"capture_setting":flags.ff_capture_setting,"simple_action":flags.ff_simple_action,"system_metrics":flags.ff_system_metrics,"clipboard":flags.ff_clipboard,"file_transfer":flags.ff_file_transfer_ftp,"file_transfer_v2":flags.ff_file_transfer_ftp2,"virtual_mouse":flags.ff_virtual_mouse_device}));
+                }
                 if !self.protocol_ready {
                     self.protocol_ready = true;
                     self.phase("protobuf_ready");
                     self.announce_download_path().await?;
+                    self.send_protobuf(wire::action(22)).await?;
+                    // Official checkSystemMetric requests GENERAL and SETTING explicitly.
+                    self.send_protobuf(wire::wrap(pb::message::Which::SystemMetrics(
+                        pb::SystemMetrics {
+                            metrics: vec![1, 2],
+                            ..Default::default()
+                        },
+                    )))
+                    .await?;
                     self.start_selected_video_track().await?;
+                    self.bootstrap_headless().await?;
                     self.restore_screen_preference().await?;
                 }
             }
             Some(pb::message::Which::Screens(screens)) => {
+                if self.output.media.geometry().screen_id != screens.current_screen_id {
+                    self.release_inputs().await;
+                }
+                self.output.media.screen(screens.current_screen_id);
                 crate::perf::trace(
                     "screen_parameters",
                     crate::perf::screen_parameters(&screens),
@@ -1424,6 +1684,8 @@ impl Session {
                 );
                 self.start_selected_video_track().await?;
                 self.super_screen.screens(&screens, &self.output);
+                self.virtual_displays.screens(&screens, &self.output);
+                self.bootstrap_headless().await?;
                 self.restore_screen_preference().await?;
                 let rows: Vec<Value> = screens
                     .screens
@@ -1431,7 +1693,7 @@ impl Session {
                     .map(|s| {
                         json!({
                             "id":s.id,"name":s.display_name,"primary":s.is_primary_screen,
-                            "screen_type":s.screen_type,"fps":s.fps,"dpi":s.dpi_scale.as_ref().map(|d|d.current_dpi),
+                            "screen_type":s.screen_type,"fps":s.fps,"dpi":s.dpi_scale.as_ref().map(|d|d.current_dpi),"dpis":s.dpi_scale.as_ref().map(|d|&d.dpis),"dpr":s.dpr,"video_track_index":s.video_track_index,
                             "width":s.current_resolution.as_ref().map(|r|r.width),
                             "height":s.current_resolution.as_ref().map(|r|r.height),
                             "resolutions":s.resolutions.iter().map(|r|json!({"width":r.width,"height":r.height})).collect::<Vec<_>>()
@@ -1444,6 +1706,14 @@ impl Session {
                 );
             }
             Some(pb::message::Which::ClipboardChange(text)) => {
+                for packet in self.cancel_clipboard_files() {
+                    self.send_file(packet).await?;
+                }
+                if let Some(offer) = &self.file_offer {
+                    offer.remote_replaced();
+                }
+                self.file_offer = None;
+                self.clipboard_wire.clear_offer();
                 self.clipboard_text(Some(text.content));
             }
             Some(pb::message::Which::RpcRequest(request)) => {
@@ -1454,6 +1724,14 @@ impl Session {
                     .unwrap_or(0);
                 match request.which {
                     Some(pb::rpc_request::Which::TextChangeRequest(text)) => {
+                        for packet in self.cancel_clipboard_files() {
+                            self.send_file(packet).await?;
+                        }
+                        if let Some(offer) = &self.file_offer {
+                            offer.remote_replaced();
+                        }
+                        self.file_offer = None;
+                        self.clipboard_wire.clear_offer();
                         self.clipboard_text(Some(text.data));
                         self.send_protobuf(wire::response(
                             id,
@@ -1472,6 +1750,39 @@ impl Session {
                         }
                     }
                     Some(pb::rpc_request::Which::ClipRequest(request)) => {
+                        let sync_files = self.clipboard_enabled
+                            && self.files_allowed
+                            && self.local_files_allowed
+                            && matches!(&request.which,Some(pb::clipboard_request::Which::FormatList(f)) if f.has_action==0 && f.formats.iter().any(|f|f.name.eq_ignore_ascii_case("FileGroupDescriptorW")));
+                        crate::perf::trace(
+                            "clipboard_request",
+                            super::clipboard_wire::request_summary(&request),
+                        );
+                        if matches!(
+                            request.which,
+                            Some(pb::clipboard_request::Which::FormatList(_))
+                        ) {
+                            for packet in self.cancel_clipboard_files() {
+                                self.send_file(packet).await?;
+                            }
+                            if let Some(offer) = &self.file_offer {
+                                offer.remote_replaced();
+                            }
+                            self.file_offer = None;
+                        }
+                        if let Some(offer) = &self.file_offer {
+                            match offer.request(id, request.clone()) {
+                                Ok(true) => return Ok(()),
+                                Ok(false) => {}
+                                Err(e) => {
+                                    self.output.native(
+                                        "clipboard_error",
+                                        json!({"message":e.to_string()}),
+                                    );
+                                    return Ok(());
+                                }
+                            }
+                        }
                         if super::drag_files::is_drag_request(&request) {
                             for message in self.drag_files.request(
                                 id,
@@ -1482,21 +1793,36 @@ impl Session {
                             ) {
                                 self.send_file(message).await?;
                             }
+                            self.receive_clipboard_files();
                             return Ok(());
                         }
-                        match self
-                            .clipboard_wire
-                            .request(id, request, self.clipboard_enabled)
-                        {
+                        match self.clipboard_wire.request(
+                            id,
+                            request,
+                            self.clipboard_enabled && !sync_files,
+                        ) {
                             Ok((messages, text)) => {
                                 for message in messages {
-                                    self.send_protobuf(message).await?;
+                                    self.send_file(message).await?;
                                 }
                                 self.clipboard_text(text);
+                                self.clipboard_image();
                             }
                             Err(e) => self
                                 .output
                                 .native("clipboard_error", json!({"message":e.to_string()})),
+                        }
+                        if sync_files {
+                            match self.begin_clipboard_files() {
+                                Ok(packets) => {
+                                    for packet in packets {
+                                        self.send_file(packet).await?;
+                                    }
+                                }
+                                Err(e) => self
+                                    .output
+                                    .native("clipboard_error", json!({"message":e.to_string()})),
+                            }
                         }
                     }
                     _ => {}
@@ -1540,18 +1866,45 @@ impl Session {
                         .native("video_track_result", json!({"error":result.error_code}));
                 }
                 if let Some(pb::rpc_response::Which::ClipResponse(clip)) = &response.which {
+                    crate::perf::trace(
+                        "clipboard_response",
+                        super::clipboard_wire::response_summary(clip),
+                    );
                     let id = response
                         .response_header
                         .as_ref()
                         .map_or(0, |h| h.request_id);
+                    if let Some(offer) = &self.file_offer {
+                        offer.response(id, clip.clone());
+                    }
                     for message in self.drag_files.response(id, clip.clone(), &self.output) {
                         self.send_file(message).await?;
                     }
+                    self.receive_clipboard_files();
                     match self.clipboard_wire.response(clip.clone()) {
                         Ok(text) => self.clipboard_text(text),
                         Err(e) => self
                             .output
                             .native("clipboard_error", json!({"message":e.to_string()})),
+                    }
+                    self.clipboard_image();
+                    for message in self.clipboard_wire.take_outgoing() {
+                        self.send_file(message).await?;
+                    }
+                    if self.clipboard_offer == Some(id)
+                        && matches!(
+                            clip.which,
+                            Some(pb::clipboard_response::Which::FormatListResponse(_))
+                        )
+                    {
+                        self.clipboard_offer = None;
+                        if self.clipboard_paste_offer.take() == Some(id)
+                            && self.clipboard_enabled
+                            && !self.read_only
+                        {
+                            self.paste_keys().await?;
+                        }
+                        self.output.native("clipboard_image_offered",json!({"error":1,"format":"image","request_id":id,"state":"offered","content_transfer":"on_remote_request"}));
                     }
                 }
                 if let Some(pb::rpc_response::Which::FileTransferFtpResponse(ftp)) = &response.which
@@ -1576,6 +1929,29 @@ impl Session {
                     .as_ref()
                     .map_or(0, |h| h.request_id);
                 match &response.which {
+                    Some(pb::rpc_response::Which::VirtualAudioDriverPolicyRsp(r)) => {
+                        if let Some((request, enabled, _)) = self.microphone_pending
+                            && request == rpc_id
+                        {
+                            self.microphone_pending = None;
+                            if let Some(microphone) = &self.microphone {
+                                microphone
+                                    .enabled
+                                    .store(enabled && r.error_code == 0, Ordering::Relaxed);
+                            }
+                            self.output.native("microphone_policy", json!({"request_id":rpc_id,"enabled":enabled,"accepted":r.error_code==0,"error_code":r.error_code}));
+                            if r.error_code == 0 {
+                                self.send_protobuf(wire::action(if enabled { 23 } else { 24 }))
+                                    .await?;
+                            }
+                        }
+                    }
+                    Some(pb::rpc_response::Which::CreateVirtualDisplayRsp(r)) => self
+                        .virtual_displays
+                        .response(rpc_id, r.error_code, &self.output),
+                    Some(pb::rpc_response::Which::RemoveVirtualDisplayRsp(r)) => self
+                        .virtual_displays
+                        .response(rpc_id, r.error_code, &self.output),
                     Some(pb::rpc_response::Which::EnterSuperScreenRep(r)) => self
                         .super_screen
                         .response(rpc_id, true, r.error_code, &self.output),
@@ -1588,7 +1964,7 @@ impl Session {
                     let errors: Vec<Value> = setting
                         .errors
                         .into_iter()
-                        .map(|e| json!({"code":e.error_code}))
+                        .map(|e| json!({"code":e.error_code,"message":e.error_message,"detail":e.error_detail}))
                         .collect();
                     self.output.native(
                         "capture_result",
@@ -1603,16 +1979,107 @@ impl Session {
         }
         Ok(())
     }
+    async fn paste_keys(&mut self) -> Result<()> {
+        self.release_inputs().await;
+        for (action, key) in [
+            ("kbd_press", 17),
+            ("kbd_press", 86),
+            ("kbd_release", 86),
+            ("kbd_release", 17),
+        ] {
+            self.send_control(json!({"action":action,"key":key}).to_string().into_bytes())
+                .await?;
+        }
+        Ok(())
+    }
+    async fn bootstrap_headless(&mut self) -> Result<()> {
+        if let Some(packet) = self.virtual_displays.headless_bootstrap(
+            self.video_visible && self.metrics.decoded.load(Ordering::Relaxed) == 0,
+            self.protocol_ready,
+            &self.output,
+        )? {
+            self.send_protobuf(packet).await?;
+        }
+        Ok(())
+    }
+    fn cancel_clipboard_files(&mut self) -> Vec<Vec<u8>> {
+        if let Some((id, _)) = self.clipboard_files_pending.take()
+            && self.drag_files.active(id)
+        {
+            return self.drag_files.cancel(&self.output);
+        }
+        vec![]
+    }
+    fn begin_clipboard_files(&mut self) -> Result<Vec<Vec<u8>>> {
+        const CAPACITY: u64 = 1024 * 1024 * 1024;
+        ensure!(
+            self.clipboard_cache_count < 32 && self.clipboard_cache_bytes < CAPACITY,
+            "本次连接的剪贴板缓存已满，请使用文件窗口传输"
+        );
+        let storage = Arc::new(
+            tempfile::Builder::new()
+                .prefix("uux-clipboard-")
+                .tempdir()?,
+        );
+        let id = 0x5000_0000 | ((uuid::Uuid::new_v4().as_u128() as u32) & 0x0fff_ffff);
+        let packets = self.drag_files.begin_limited(
+            storage.path(),
+            Some(id),
+            false,
+            Some(CAPACITY - self.clipboard_cache_bytes),
+            &self.output,
+        )?;
+        self.clipboard_files_pending = Some((id, storage));
+        Ok(packets)
+    }
+    fn receive_clipboard_files(&mut self) {
+        if let Some((id, paths, bytes)) = self.drag_files.take_completed()
+            && self
+                .clipboard_files_pending
+                .as_ref()
+                .is_some_and(|p| p.0 == id)
+            && let Some((_, storage)) = self.clipboard_files_pending.take()
+        {
+            self.clipboard_cache_count += 1;
+            self.clipboard_cache_bytes += bytes;
+            if self.clipboard_enabled
+                && let Some(clipboard) = &self.clipboard
+            {
+                clipboard.remote_files(paths, storage);
+            }
+        }
+        if self
+            .clipboard_files_pending
+            .as_ref()
+            .is_some_and(|p| !self.drag_files.active(p.0))
+        {
+            self.clipboard_files_pending = None;
+        }
+    }
     fn clipboard_text(&self, text: Option<String>) {
         if let Some(text) = text {
             if self.clipboard_observe {
-                self.output.native("clipboard_value",json!({"text":text,"source":"remote","observed_at_ms":crate::service::now_ms()}));
+                self.output.native("clipboard_value",json!({"text":text,"format":"text","source":"remote","observed_at_ms":crate::service::now_ms()}));
             }
             if let Some(clipboard) = &self.clipboard {
                 self.output
                     .native("clipboard_received", json!({"bytes":text.len()}));
                 clipboard.remote(text);
             }
+        }
+    }
+    fn clipboard_image(&mut self) {
+        if let Some(png) = self.clipboard_wire.image.take() {
+            if self.clipboard_observe {
+                self.output.native("clipboard_value",json!({"format":"image","mime_type":"image/png","data_base64":base64::engine::general_purpose::STANDARD.encode(&png),"source":"remote","observed_at_ms":crate::service::now_ms()}));
+            }
+            if let Some(clipboard) = &self.clipboard {
+                clipboard.remote_image(png);
+            }
+        }
+        if let Some(error) = self.clipboard_wire.error.take() {
+            self.output
+                .native("clipboard_error", json!({"message":error}));
         }
     }
     fn file_request(&mut self, id: i64, ftp: pb::FileTransferFtpRequest) -> Vec<Vec<u8>> {
@@ -1674,15 +2141,18 @@ impl Session {
                         set_video_wait(&mut self.video_deadline,command["enabled"].as_bool().unwrap_or(true),
                             self.first_frame_announced,Instant::now());
                         self.begin_deferred_capture().await?;
+                        self.bootstrap_headless().await?;
                         self.restore_screen_preference().await?;
                         continue;
                     }
                     let client_request=command.get("client_request").cloned();
+                    let microphone_command=command["op"]=="microphone";
                     let result=self.command(command).await;
                     if let Some(request)=client_request {
                         self.output.native("command_result",json!({"client_request":request,"ok":result.is_ok(),"error":result.as_ref().err().map(|e|e.to_string())}));
                     }
                     if let Err(e)=result {
+                        if microphone_command {self.output.native("microphone_policy",json!({"accepted":false,"error":e.to_string()}));}
                         self.output.event(Event::Error{scope:"operation".into(),message:e.to_string(),generation:Some(self.generation),login_id:None});
                     }
                 },
@@ -1707,8 +2177,12 @@ impl Session {
                         self.output.native("lookup_probe", probe.timeout());
                     }
                     for message in self.files.tick(&self.output){self.send_file(message).await?;}
+                    self.clipboard_wire.tick();
+                    self.clipboard_image();
                     for message in self.drag_files.tick(&self.output){self.send_file(message).await?;}
+                    self.receive_clipboard_files();
                     self.super_screen.tick(&self.output);
+                    self.virtual_displays.tick(&self.output);
                     self.begin_deferred_capture().await?;
                     let frames=self.metrics.decoded.load(Ordering::Relaxed);
                     let samples=self.metrics.samples.load(Ordering::Relaxed);
@@ -1718,6 +2192,13 @@ impl Session {
                     let buffered = if let Some(channel) = self.channels.get(CONTROL) { channel.buffered_amount().await } else { 0 };
                     let text_buffered = if let Some(channel) = self.channels.get(TEXT) { channel.buffered_amount().await } else { 0 };
                     let video_size = self.metrics.video_size.load(Ordering::Relaxed);
+                    if let Some(audio)=&self.audio {self.output.native("audio_status",audio.status.lock().unwrap().clone());}
+                    if let Some(microphone)=&self.microphone {self.output.native("microphone_status",microphone.status.lock().unwrap().clone());}
+                    if self.microphone_pending.is_some_and(|(_,_,start)|start.elapsed()>Duration::from_secs(8)) {
+                        let (request,enabled,_) = self.microphone_pending.take().unwrap();
+                        self.output.native("microphone_policy",json!({"request_id":request,"enabled":enabled,"accepted":false,"error":"远端虚拟声卡策略确认超时"}));
+                    }
+                    self.output.native("decoder_status",self.output.media.decoder.lock().unwrap().clone());
                     self.output.native("stats",json!({
                         "generation":self.generation,"fps":((frames-last_frames) as f64/interval).round() as u64,
                         "source_fps":((samples-last_samples) as f64/interval).round() as u64,
@@ -1757,6 +2238,13 @@ impl Session {
         }
     }
     async fn command(&mut self, command: Value) -> Result<()> {
+        if let Some(binding) = command.get("geometry") {
+            let geometry: crate::media_bus::Geometry = serde_json::from_value(binding.clone())?;
+            if geometry != self.output.media.geometry() {
+                self.release_inputs().await;
+                bail!("屏幕或画面版本已变化，旧坐标已拒绝");
+            }
+        }
         let op = command["op"].as_str().unwrap_or("");
         if self.read_only
             && matches!(
@@ -1770,6 +2258,7 @@ impl Session {
                     | "click"
                     | "scroll"
                     | "text"
+                    | "touch"
                     | "paste_local"
             )
         {
@@ -1818,10 +2307,72 @@ impl Session {
                     self.release_inputs().await;
                 }
                 if !self.local_files_allowed {
+                    self.file_offer = None;
                     self.files.close(&self.output);
                     self.files = Default::default();
                     for message in self.drag_files.cancel(&self.output) {
                         self.send_file(message).await?;
+                    }
+                }
+                return Ok(());
+            }
+            "touch" => {
+                ensure!(
+                    self.touch_supported != Some(false),
+                    "远端报告不支持触摸输入"
+                );
+                let event_type = match command["phase"].as_str() {
+                    Some("start") => 1,
+                    Some("move") => 2,
+                    Some("end") => 3,
+                    Some("cancel") => 4,
+                    _ => bail!("触摸阶段无效"),
+                };
+                let points = command["points"].as_array().context("需要触摸点数组")?;
+                ensure!(
+                    !points.is_empty() && points.len() <= 10,
+                    "一次触摸须为 1–10 个触点"
+                );
+                let mut ids = BTreeSet::new();
+                let mut touch_points = Vec::new();
+                for point in points {
+                    let id = u32::try_from(point["id"].as_u64().context("触点编号无效")?)?;
+                    ensure!(ids.insert(id), "触点编号重复");
+                    let x = point["x"].as_f64().context("触点 x 无效")?;
+                    let y = point["y"].as_f64().context("触点 y 无效")?;
+                    let pressure = point["pressure"].as_f64().unwrap_or(0.5);
+                    ensure!(
+                        (0.0..=1.0).contains(&x)
+                            && (0.0..=1.0).contains(&y)
+                            && (0.0..=1.0).contains(&pressure),
+                        "触点坐标或压力超出范围"
+                    );
+                    ensure!(
+                        event_type == 4
+                            || (event_type == 1 && !self.touches.contains(&id))
+                            || (event_type != 1 && self.touches.contains(&id)),
+                        "触点生命周期无效"
+                    );
+                    touch_points.push(pb::TouchEventPoint {
+                        id,
+                        x: x as f32,
+                        y: y as f32,
+                        pressure: pressure as f32,
+                        ..Default::default()
+                    });
+                }
+                self.send_protobuf(wire::wrap(pb::message::Which::InputEvent(pb::InputEvent {
+                    which: Some(pb::input_event::Which::TouchEvent(pb::TouchEvent {
+                        event_type,
+                        touch_points,
+                    })),
+                })))
+                .await?;
+                for id in ids {
+                    if event_type == 1 {
+                        self.touches.insert(id);
+                    } else if event_type >= 3 {
+                        self.touches.remove(&id);
                     }
                 }
                 return Ok(());
@@ -1863,13 +2414,118 @@ impl Session {
                 json!({"action":"text_input","content":text})
             }
             "clipboard_get" => {
+                if command["scope"] == "local" {
+                    self.clipboard
+                        .as_ref()
+                        .context("本地剪贴板不可用")?
+                        .local(command);
+                    return Ok(());
+                }
+                if command["format"] == "files" {
+                    if self.file_offer.as_ref().is_some_and(|f| f.finished()) {
+                        self.file_offer = None;
+                    }
+                    ensure!(
+                        self.files_allowed && self.local_files_allowed,
+                        "当前会话未允许文件传输"
+                    );
+                    ensure!(
+                        self.file_offer.is_none(),
+                        "本机正在提供文件剪贴板，请先完成粘贴再读取远端文件"
+                    );
+                    let directory = std::path::PathBuf::from(
+                        command["destination"]
+                            .as_str()
+                            .context("缺少接收目录 destination")?,
+                    );
+                    let id = command["queued_id"]
+                        .as_i64()
+                        .filter(|n| *n < 0 && *n > -(0x4000_0000i64))
+                        .context("文件任务编号无效")?;
+                    for packet in self.drag_files.begin(
+                        &directory,
+                        Some((-id) as u32),
+                        false,
+                        &self.output,
+                    )? {
+                        self.send_file(packet).await?;
+                    }
+                    return Ok(());
+                }
                 self.clipboard_observe = true;
-                let request = self.clipboard_wire.ask_text();
-                return self.send_protobuf(request).await;
+                let request = if command["format"] == "image" {
+                    self.clipboard_wire.validate_remote_image_read()?;
+                    self.clipboard_wire.ask_image()
+                } else {
+                    self.clipboard_wire.ask_text()
+                };
+                return self.send_file(request).await;
+            }
+            "clipboard_local" => {
+                for packet in self.cancel_clipboard_files() {
+                    self.send_file(packet).await?;
+                }
+                self.clipboard
+                    .as_ref()
+                    .context("本地剪贴板不可用")?
+                    .local(command);
+                return Ok(());
+            }
+            "clipboard_files" => {
+                ensure!(
+                    self.files_allowed && self.local_files_allowed,
+                    "当前会话未允许文件传输"
+                );
+                if command["drop"].is_object() {
+                    ensure!(
+                        !self.read_only && command["geometry"].is_object(),
+                        "拖放需要有效画面和控制权限"
+                    );
+                    ensure!(
+                        command["drop"]["screen_id"] == self.output.media.geometry().screen_id,
+                        "拖放屏幕已失效"
+                    );
+                }
+                for packet in self.cancel_clipboard_files() {
+                    self.send_file(packet).await?;
+                }
+                self.file_offer = None;
+                self.clipboard_wire.clear_offer();
+                self.file_offer = Some(super::clipboard_files::FileOffer::start(
+                    &command,
+                    self.output.clone(),
+                    self.incoming_tx.clone(),
+                )?);
+                return Ok(());
+            }
+            "clipboard_image" => {
+                for packet in self.cancel_clipboard_files() {
+                    self.send_file(packet).await?;
+                }
+                self.file_offer = None;
+                let data = command["data_base64"]
+                    .as_str()
+                    .context("缺少 PNG data_base64")?;
+                ensure!(data.len() <= 2 * 1024 * 1024 * 4 / 3 + 4, "PNG 超过 2 MiB");
+                let (id, bytes) = self
+                    .clipboard_wire
+                    .offer_image(&base64::engine::general_purpose::STANDARD.decode(data)?)?;
+                self.send_file(bytes).await?;
+                self.clipboard_offer = Some(id);
+                self.output.native(
+                    "clipboard_image_submitted",
+                    json!({"request_id":id,"client_request":command["client_request"]}),
+                );
+                return Ok(());
             }
             "clipboard" => {
+                for packet in self.cancel_clipboard_files() {
+                    self.send_file(packet).await?;
+                }
+                self.file_offer = None;
                 let text = command["text"].as_str().context("剪贴板文本无效")?;
                 ensure!(text.len() <= 65536, "单次同步的剪贴板文字超过 64 KiB");
+                self.clipboard_wire.clear_offer();
                 let (_, bytes) = wire::rpc(pb::rpc_request::Which::TextChangeRequest(
                     pb::ClipboardTextChangeRequest {
                         format_id: 13,
@@ -1885,6 +2541,9 @@ impl Session {
                     self.files_allowed && self.local_files_allowed,
                     "当前会话未允许文件传输"
                 );
+                if let Some(offer) = &self.file_offer {
+                    offer.command(&command)?;
+                }
                 for message in self.drag_files.command(&command, &self.output)? {
                     self.send_file(message).await?;
                 }
@@ -1897,11 +2556,23 @@ impl Session {
                 return Ok(());
             }
             "release" => {
+                if let Some(offer) = &mut self.file_offer
+                    && offer.input_pending
+                {
+                    offer.reject("输入控制权已释放，请重新拖放或粘贴");
+                    offer.input_pending = false;
+                }
+                self.clipboard_paste_offer = None;
                 self.release_inputs().await;
                 return Ok(());
             }
             "clipboard_enabled" => {
                 self.clipboard_enabled = command["enabled"].as_bool().unwrap_or(true);
+                if !self.clipboard_enabled {
+                    for packet in self.cancel_clipboard_files() {
+                        self.send_file(packet).await?;
+                    }
+                }
                 if let Some(clipboard) = &self.clipboard {
                     clipboard.enable(self.clipboard_enabled);
                 }
@@ -1929,10 +2600,85 @@ impl Session {
             "audio" => {
                 let enabled = command["enabled"].as_bool().unwrap_or(true);
                 if let Some(audio) = &self.audio {
+                    if let Some(device) = command.get("device_id") {
+                        *audio.device.lock().unwrap() = if device.is_null() || device == "default" {
+                            None
+                        } else {
+                            Some(device.as_str().context("device_id 无效")?.to_owned())
+                        };
+                    }
                     audio.enabled.store(enabled, Ordering::Relaxed);
                 }
-                self.send_protobuf(wire::action(if enabled { 25 } else { 26 }))
-                    .await?;
+                self.send_protobuf(wire::action(if enabled || self.audio_subscription {
+                    25
+                } else {
+                    26
+                }))
+                .await?;
+                return Ok(());
+            }
+            "microphone" => {
+                let enabled = command["enabled"].as_bool().context("缺少 enabled")?;
+                ensure!(
+                    !enabled
+                        || self
+                            .microphone_transceiver
+                            .as_ref()
+                            .is_some_and(|t| matches!(
+                                t.current_direction(),
+                                RTCRtpTransceiverDirection::Sendonly
+                                    | RTCRtpTransceiverDirection::Sendrecv
+                            )),
+                    "远端未协商接收麦克风的音频轨道"
+                );
+                ensure!(
+                    self.microphone_pending.is_none() || !enabled,
+                    "正在等待远端麦克风确认"
+                );
+                let microphone = self.microphone.as_ref().context("此会话未协商麦克风轨道")?;
+                microphone.enabled.store(false, Ordering::Relaxed);
+                if let Some(device) = command.get("device_id") {
+                    *microphone.device.lock().unwrap() = if device.is_null() || device == "default"
+                    {
+                        None
+                    } else {
+                        Some(device.as_str().context("device_id 无效")?.to_owned())
+                    };
+                }
+                // Official ControlPresenter sends policy=1 on open, 0 on close.
+                let (request, bytes) =
+                    wire::rpc(pb::rpc_request::Which::VirtualAudioDriverPolicyReq(
+                        pb::VirtualAudioDriverPolicyRequest {
+                            policy: i32::from(enabled),
+                        },
+                    ));
+                self.send_protobuf(bytes).await?;
+                self.microphone_pending = Some((request, enabled, Instant::now()));
+                self.output.native("microphone_submitted",json!({"request_id":request,"enabled":enabled,"client_request":command["client_request"]}));
+                return Ok(());
+            }
+            "audio_receive" => {
+                self.audio_subscription = command["enabled"].as_bool().unwrap_or(false);
+                let playback = self
+                    .audio
+                    .as_ref()
+                    .is_some_and(|a| a.enabled.load(Ordering::Relaxed));
+                self.send_protobuf(wire::action(if playback || self.audio_subscription {
+                    25
+                } else {
+                    26
+                }))
+                .await?;
+                return Ok(());
+            }
+            "virtual_display_create" | "virtual_display_remove" => {
+                self.release_inputs().await;
+                let message = self.virtual_displays.command(&command, &self.output)?;
+                if let Err(error) = self.send_protobuf(message).await {
+                    self.virtual_displays
+                        .failed(&error.to_string(), &self.output);
+                    return Err(error);
+                }
                 return Ok(());
             }
             "super_screen" => {
@@ -1944,7 +2690,28 @@ impl Session {
                 }
                 return Ok(());
             }
+            "decoder" => {
+                let preference = command["preference"].as_str().context("缺少本地解码偏好")?;
+                ensure!(
+                    super::decoder::preferences().contains(&preference),
+                    "本地解码偏好无效"
+                );
+                *self.output.media.decoder_preference.lock().unwrap() = preference.into();
+                self.output
+                    .media
+                    .request_keyframe
+                    .store(true, Ordering::Relaxed);
+                return Ok(());
+            }
             "capture" => {
+                crate::capabilities::validate_capture(&self.remote_streamer, &command)?;
+                let mut merged = self
+                    .capture_requested
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                merged.extend(command.as_object().context("显示参数无效")?.clone());
+                let command = Value::Object(merged);
                 self.finish_startup_recovery().await?;
                 let fps = command["fps"].as_i64().unwrap_or(60) as i32;
                 ensure!([30, 60, 90, 144].contains(&fps), "帧率无效");
@@ -1957,6 +2724,14 @@ impl Session {
                         || ((320..=3840).contains(&width) && (200..=2160).contains(&height)),
                     "分辨率超出支持范围"
                 );
+                let codec = match command["codec"].as_str().unwrap_or("h264") {
+                    "h264" => 1,
+                    "h265" => 2,
+                    _ => bail!("编码格式无效"),
+                };
+                let chroma = if command["true_color"] == true { 3 } else { 1 };
+                let dpi = command["dpi"].as_i64().unwrap_or(0);
+                ensure!(dpi == 0 || (50..=500).contains(&dpi), "DPI 比例无效");
                 let bitrate = command["bitrate"].as_i64().unwrap_or(0);
                 ensure!((0..=40_000_000).contains(&bitrate), "码率无效");
                 // Diagnostic comparison: the legacy resolution-only RPC leaves
@@ -1979,11 +2754,13 @@ impl Session {
                         frame_quality: quality as i32,
                         cursor_capture: true,
                         screen_id: command["screen_id"].as_i64().unwrap_or(0) as i32,
-                        chorma_format: 1,
+                        chorma_format: chroma,
+                        dpi_scale: dpi as i32,
+                        enable_hdr: command["hdr"] == true,
                         resolution_type: if width > 0 { 4 } else { 3 },
                         resolution_width: width as i32,
                         resolution_height: height as i32,
-                        codec_type: 1,
+                        codec_type: codec,
                         max_custom_bitrate: bitrate as i32,
                         ..Default::default()
                     })
@@ -2000,6 +2777,8 @@ impl Session {
                 let started = Instant::now();
                 let result = self.send_protobuf(bytes).await;
                 if result.is_ok() {
+                    self.capture_requested = command.clone();
+                    self.output.native("display_requested", command.clone());
                     self.output.native(
                         "capture_submitted",
                         json!({
@@ -2080,7 +2859,7 @@ impl Session {
                     Ok(())
                 }
                 .await;
-                self.output.native("port_status",json!({"id":id,"enabled":enabled && result.is_ok(),"status":if result.is_err(){"failed"}else if enabled{"listening"}else{"disabled"},
+                self.output.native("port_status",json!({"id":id,"scope":"listener","listening":enabled && result.is_ok(),"last_target_state":"not_attempted","enabled":enabled && result.is_ok(),"status":if result.is_err(){"failed"}else if enabled{"listening"}else{"disabled"},
                     "message":result.err().map_or(if enabled{"已启用"}else{"未启用"}.into(),|e|e.to_string())}));
                 return Ok(());
             }
@@ -2104,6 +2883,23 @@ impl Session {
         Ok(())
     }
     async fn release_inputs(&mut self) {
+        if !self.touches.is_empty() {
+            let touch_points = std::mem::take(&mut self.touches)
+                .into_iter()
+                .map(|id| pb::TouchEventPoint {
+                    id,
+                    ..Default::default()
+                })
+                .collect();
+            let _ = self
+                .send_protobuf(wire::wrap(pb::message::Which::InputEvent(pb::InputEvent {
+                    which: Some(pb::input_event::Which::TouchEvent(pb::TouchEvent {
+                        event_type: 4,
+                        touch_points,
+                    })),
+                })))
+                .await;
+        }
         for key in std::mem::take(&mut self.keys) {
             let _ = self
                 .send_control(
@@ -2136,8 +2932,12 @@ impl Session {
         }
     }
     async fn close(&mut self) {
+        self.file_offer = None;
         let started = Instant::now();
         let drag_cancel = self.drag_files.cancel(&self.output);
+        if let Some(microphone) = &self.microphone {
+            microphone.enabled.store(false, Ordering::Relaxed);
+        }
         self.phase("releasing");
         self.files.close(&self.output);
         // Never let a blocked channel prevent the signaling release.
@@ -2146,6 +2946,12 @@ impl Session {
         let port_close = self.ports.close().await;
         let _ = tokio::time::timeout(Duration::from_millis(750), async {
             self.release_inputs().await;
+            if self.microphone.is_some() {
+                let (_, bytes) = wire::rpc(pb::rpc_request::Which::VirtualAudioDriverPolicyReq(
+                    pb::VirtualAudioDriverPolicyRequest { policy: 0 },
+                ));
+                let _ = self.send_protobuf(bytes).await;
+            }
             for frame in port_close {
                 let _ = self
                     .send_file(wire::wrap(pb::message::Which::PortMappingFrame(frame)))
@@ -2190,6 +2996,9 @@ impl Session {
         }
         self.channels.clear();
         self.audio = None;
+        self.microphone = None;
+        self.microphone_transceiver = None;
+        self.microphone_pending = None;
         self.clipboard = None;
         if let Some(inhibitor) = self.inhibitor.take() {
             inhibitor.release().await;

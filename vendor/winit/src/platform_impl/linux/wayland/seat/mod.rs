@@ -19,6 +19,7 @@ use crate::event::WindowEvent;
 use crate::keyboard::ModifiersState;
 use crate::platform_impl::wayland::state::WinitState;
 
+pub(crate) mod data_device;
 mod keyboard;
 mod pointer;
 mod text_input;
@@ -82,18 +83,18 @@ impl SeatHandler for WinitState {
             None => {
                 warn!("Received wl_seat::new_capability for unknown seat");
                 return;
-            },
+            }
         };
 
         match capability {
             SeatCapability::Touch if seat_state.touch.is_none() => {
                 seat_state.touch = self.seat_state.get_touch(queue_handle, &seat).ok();
-            },
+            }
             SeatCapability::Keyboard if seat_state.keyboard_state.is_none() => {
                 let keyboard = seat.get_keyboard(queue_handle, KeyboardData::new(seat.clone()));
                 seat_state.keyboard_state =
                     Some(KeyboardState::new(keyboard, self.loop_handle.clone()));
-            },
+            }
             SeatCapability::Pointer if seat_state.pointer.is_none() => {
                 let surface = self.compositor_state.create_surface(queue_handle);
                 let viewport = self
@@ -125,15 +126,19 @@ impl SeatHandler for WinitState {
                 let themed_pointer = Arc::new(themed_pointer);
 
                 // Register cursor surface.
-                self.pointer_surfaces.insert(surface_id, themed_pointer.clone());
+                self.pointer_surfaces
+                    .insert(surface_id, themed_pointer.clone());
 
                 seat_state.pointer = Some(themed_pointer);
-            },
+            }
             _ => (),
         }
 
-        if let Some(text_input_state) =
-            seat_state.text_input.is_none().then_some(self.text_input_state.as_ref()).flatten()
+        if let Some(text_input_state) = seat_state
+            .text_input
+            .is_none()
+            .then_some(self.text_input_state.as_ref())
+            .flatten()
         {
             seat_state.text_input = Some(Arc::new(text_input_state.get_text_input(
                 &seat,
@@ -155,7 +160,7 @@ impl SeatHandler for WinitState {
             None => {
                 warn!("Received wl_seat::remove_capability for unknown seat");
                 return;
-            },
+            }
         };
 
         if let Some(text_input) = seat_state.text_input.take() {
@@ -169,7 +174,7 @@ impl SeatHandler for WinitState {
                         touch.release();
                     }
                 }
-            },
+            }
             SeatCapability::Pointer => {
                 if let Some(relative_pointer) = seat_state.relative_pointer.take() {
                     relative_pointer.destroy();
@@ -190,11 +195,11 @@ impl SeatHandler for WinitState {
                         pointer.pointer().release();
                     }
                 }
-            },
+            }
             SeatCapability::Keyboard => {
                 seat_state.keyboard_state = None;
                 self.on_keyboard_destroy(&seat.id());
-            },
+            }
             _ => (),
         }
     }
@@ -205,6 +210,11 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
+        if let Some(manager) = &self.file_dnd.manager {
+            self.file_dnd
+                .devices
+                .insert(seat.id(), manager.get_data_device(_queue_handle, &seat));
+        }
         self.seats.insert(seat.id(), WinitSeatState::new());
     }
 
@@ -214,6 +224,9 @@ impl SeatHandler for WinitState {
         _queue_handle: &QueueHandle<Self>,
         seat: WlSeat,
     ) {
+        if let Some(device) = self.file_dnd.devices.remove(&seat.id()) {
+            self.dnd_remove_device(&device.inner().id());
+        }
         let _ = self.seats.remove(&seat.id());
         self.on_keyboard_destroy(&seat.id());
     }
@@ -226,7 +239,8 @@ impl WinitState {
             let had_focus = window.has_focus();
             window.remove_seat_focus(seat);
             if had_focus != window.has_focus() {
-                self.events_sink.push_window_event(WindowEvent::Focused(false), *window_id);
+                self.events_sink
+                    .push_window_event(WindowEvent::Focused(false), *window_id);
             }
         }
     }

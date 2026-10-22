@@ -32,6 +32,32 @@ impl Drop for Operation {
         self.hub.lock().unwrap().operations.remove(&self.key);
     }
 }
+pub struct ResourceGuard {
+    hub: Shared,
+    session: String,
+    lease: String,
+}
+impl ResourceGuard {
+    pub fn acquire(hub: &Shared, client: &str, session: &str, kind: &str) -> Result<Self> {
+        let lease = uid();
+        hub.lock()
+            .unwrap()
+            .retain_resource(client, session, &lease, kind)?;
+        Ok(Self {
+            hub: hub.clone(),
+            session: session.into(),
+            lease,
+        })
+    }
+}
+impl Drop for ResourceGuard {
+    fn drop(&mut self) {
+        self.hub
+            .lock()
+            .unwrap()
+            .release_resource(&self.session, &self.lease);
+    }
+}
 pub fn str_arg<'a>(a: &'a Value, k: &str) -> Result<&'a str> {
     a[k].as_str()
         .filter(|s| !s.is_empty())
@@ -99,6 +125,7 @@ where
                 < 64,
             "运行中的任务过多"
         );
+        h.retain_resource(client, id, &job, "task")?;
         h.jobs.insert(
             job.clone(),
             Job {
@@ -109,6 +136,7 @@ where
                 result: json!({}),
                 error: None,
                 cancelled: false,
+                paused: false,
                 created: now_ms(),
                 updated: now_ms(),
                 transfer_ids: vec![],
@@ -117,8 +145,9 @@ where
     }
     let (h, c, s, j) = (hub.clone(), client.to_owned(), id.to_owned(), job.clone());
     std::thread::spawn(move || {
-        let result = work(h.clone(), c, s, j.clone());
-        if let Some(job) = h.lock().unwrap().jobs.get_mut(&j) {
+        let result = work(h.clone(), c, s.clone(), j.clone());
+        let mut hub = h.lock().unwrap();
+        if let Some(job) = hub.jobs.get_mut(&j) {
             job.updated = now_ms();
             job.state = if job.cancelled {
                 "cancelled"
@@ -133,6 +162,7 @@ where
                 Err(e) => job.error = Some(e.to_string()),
             }
         }
+        hub.release_resource(&s, &j);
     });
     Ok(json!({"task_id":job,"state":"running"}))
 }
@@ -155,6 +185,74 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
         ensure!(c.kind == "gui" || h.enabled, "MCP 已关闭");
     }
     match name {
+        "uu_device_power" => preferences::power(hub, client, args),
+        "uu_audio_configure" => {
+            let id = sid(args)?;
+            let target = str_arg(args, "target")?;
+            ensure!(
+                ["playback", "microphone"].contains(&target),
+                "target 必须为 playback 或 microphone"
+            );
+            let enabled = args["enabled"].as_bool().context("缺少 enabled")?;
+            let cursor = hub.lock().unwrap().ready(client, id)?.events.seq;
+            let op = if target == "playback" {
+                "audio"
+            } else {
+                "microphone"
+            };
+            let _operation = Operation::acquire(hub, id, op)?;
+            let _lease = ResourceGuard::acquire(hub, client, id, "operation")?;
+            let mut command = json!({"op":op,"enabled":enabled});
+            if let Some(device) = args.get("device_id") {
+                command["device_id"] = device.clone();
+            }
+            hub.lock()
+                .unwrap()
+                .sessions
+                .get_mut(id)
+                .unwrap()
+                .media_owners
+                .insert(op.into(), client.into());
+            let submitted = submit(hub, client, id, command)?;
+            if target == "microphone" {
+                let request = wait_event(hub, client, id, cursor, Duration::from_secs(3), |v| {
+                    v["kind"] == "microphone_submitted"
+                        && v["data"]["client_request"] == submitted["request_id"]
+                })?;
+                let policy = wait_event(hub, client, id, cursor, Duration::from_secs(10), |v| {
+                    v["kind"] == "microphone_policy"
+                        && v["data"]["request_id"] == request["data"]["request_id"]
+                })?;
+                ensure!(
+                    policy["data"]["accepted"] == true,
+                    "远端未确认虚拟声卡策略：{}",
+                    policy["data"]
+                );
+            }
+            let status = wait_event(hub, client, id, cursor, Duration::from_secs(5), |event| {
+                event["kind"]
+                    == if target == "playback" {
+                        "audio_status"
+                    } else {
+                        "microphone_status"
+                    }
+                    && event["data"]["enabled"] == enabled
+                    && args.get("device_id").is_none_or(|id| {
+                        event["data"]["requested_device"] == *id
+                            || (id == "default" && event["data"]["requested_device"].is_null())
+                    })
+            })?;
+            if status["data"]["state"] == "unavailable" {
+                let _ = session_send(hub, client, id, json!({"op":op,"enabled":false}));
+                bail!("本地音频设备不可用：{}", status["data"]["error"]);
+            }
+            Ok(
+                json!({"session_id":id,"target":target,"scope":if target=="playback" {"session_local_playback"}else{"session_microphone_send"},"confirmed":status["data"]}),
+            )
+        }
+        "uu_stream_open" => crate::streams::open(hub, client, args),
+        "uu_stream_read" => crate::streams::read_json(hub, client, args),
+        "uu_stream_close" => crate::streams::close(hub, client, args),
         "uu_account_status" => Ok(hub.lock().unwrap().account_state.clone()),
         "uu_login_start" => {
             let mut h = hub.lock().unwrap();
@@ -267,7 +365,11 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
                 json!({"sessions":h.sessions.values().map(|s|{let mut v=s.status();v["attached"]=json!(s.owners.contains(client));v}).collect::<Vec<_>>()}),
             )
         }
-        "uu_session_status" => Ok(hub.lock().unwrap().owner(client, sid(args)?)?.status()),
+        "uu_session_status" => crate::capabilities::session_status(
+            hub.lock().unwrap().owner(client, sid(args)?)?,
+            args,
+        ),
+        "uu_capabilities_get" => crate::capabilities::get(hub, client, args),
         "uu_session_close" => {
             let id = sid(args)?;
             let retained = {
@@ -290,6 +392,9 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
+        "uu_virtual_screen_create" | "uu_virtual_screen_remove" => {
+            desktop::call(hub, client, name, args)
+        }
         "uu_screenshot"
         | "uu_desktop_action"
         | "uu_type_text"
@@ -305,7 +410,6 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
         | "uu_files_delete"
         | "uu_files_upload"
         | "uu_files_download"
-        | "uu_transfer_control"
         | "uu_files_read_text"
         | "uu_files_write_text"
         | "uu_files_search" => files::call(hub, client, name, args),
@@ -327,17 +431,8 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
             );
             Ok(j.value(id))
         }
-        "uu_task_cancel" => {
-            let id = str_arg(args, "task_id")?;
-            let mut h = hub.lock().unwrap();
-            let gui = h.clients[client].kind == "gui";
-            let j = h.jobs.get_mut(id).context("任务不存在")?;
-            ensure!(j.owner == client || gui, "任务属于另一个客户端");
-            if !matches!(j.state.as_str(), "completed" | "failed" | "cancelled") {
-                j.cancelled = true;
-                j.state = "cancelling".into();
-            }
-            Ok(j.value(id))
+        "uu_task_control" | "uu_task_cancel" | "uu_transfer_control" => {
+            task_control(hub, client, name, args)
         }
         "uu_events_poll" => {
             let id = sid(args)?;
@@ -368,4 +463,57 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
         }
         _ => bail!("未知工具：{name}"),
     }
+}
+
+fn task_control(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Value> {
+    let id = str_arg(args, "task_id")?;
+    let action = if name == "uu_task_cancel" {
+        "cancel"
+    } else {
+        str_arg(args, "action")?
+    };
+    ensure!(
+        ["cancel", "pause", "resume"].contains(&action),
+        "任务操作无效"
+    );
+    let (owner, session, ids, value) = {
+        let mut h = hub.lock().unwrap();
+        let gui = h.clients[client].kind == "gui";
+        let j = h.jobs.get_mut(id).context("任务不存在")?;
+        ensure!(j.owner == client || gui, "任务属于其他客户端");
+        if matches!(j.state.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(j.value(id));
+        }
+        ensure!(
+            j.supported_actions().contains(&action),
+            "此任务不支持该操作"
+        );
+        if action == "cancel" {
+            j.cancelled = true;
+            j.state = "cancelling".into();
+        } else {
+            j.paused = action == "pause";
+            j.state = if j.paused { "pausing" } else { "resuming" }.into();
+        }
+        j.updated = now_ms();
+        (
+            j.owner.clone(),
+            j.session.clone(),
+            j.transfer_ids.clone(),
+            j.value(id),
+        )
+    };
+    for transfer in ids {
+        submit(
+            hub,
+            &owner,
+            &session,
+            if action == "cancel" {
+                json!({"op":"transfer_cancel","id":transfer})
+            } else {
+                json!({"op":"transfer_pause","id":transfer,"paused":action=="pause"})
+            },
+        )?;
+    }
+    Ok(json!({"submitted":true,"task":value}))
 }

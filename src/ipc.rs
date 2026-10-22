@@ -198,6 +198,7 @@ impl Client {
         }
         let now = Instant::now();
         Ok(Some(crate::backend::VideoFrame {
+            geometry: serde_json::from_value(value["geometry"].clone())?,
             generation: value["generation"].as_u64().unwrap_or(0),
             sequence: value["sequence"].as_u64().unwrap_or(0),
             width,

@@ -39,6 +39,7 @@ use crate::platform_impl::OsError;
 
 /// Winit's Wayland state.
 pub struct WinitState {
+    pub file_dnd: super::seat::data_device::FileDnd,
     /// The WlRegistry.
     pub registry_state: RegistryState,
 
@@ -143,8 +144,11 @@ impl WinitState {
 
         let seat_state = SeatState::new(globals, queue_handle);
 
+        let mut file_dnd=super::seat::data_device::FileDnd::default();
+        file_dnd.manager=sctk::data_device_manager::DataDeviceManagerState::bind(globals,queue_handle).ok();
         let mut seats = AHashMap::default();
         for seat in seat_state.seats() {
+            if let Some(manager)=&file_dnd.manager {file_dnd.devices.insert(seat.id(),manager.get_data_device(queue_handle,&seat));}
             seats.insert(seat.id(), WinitSeatState::new());
         }
 
@@ -159,6 +163,7 @@ impl WinitState {
         let custom_cursor_pool = Arc::new(Mutex::new(SlotPool::new(2, &shm).unwrap()));
 
         Ok(Self {
+            file_dnd,
             registry_state,
             compositor_state: Arc::new(compositor_state),
             subcompositor_state: subcompositor_state.map(Arc::new),

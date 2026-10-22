@@ -54,6 +54,30 @@ impl FavoriteDraft {
 }
 
 impl Desktop {
+    pub(super) fn is_favorite_partner(&self, id: &str) -> bool {
+        self.ui_state
+            .prefs
+            .favorite_devices
+            .iter()
+            .any(|device| device.id == id)
+    }
+
+    pub(super) fn toggle_favorite_partner(&mut self, id: &str) {
+        if self.is_favorite_partner(id) {
+            self.ui_state
+                .prefs
+                .favorite_devices
+                .retain(|device| device.id != id);
+        } else {
+            self.ui_state.prefs.favorite_devices.push(FavoriteDevice {
+                id: id.to_owned(),
+                code: String::new(),
+                name: String::new(),
+            });
+        }
+        self.ui_state.save();
+    }
+
     pub(super) fn favorite_page(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("收藏设备").font(fonts::bold(24.0)));
@@ -171,6 +195,7 @@ impl Desktop {
                 })
                 .inner;
             egui::Popup::menu(&menu).show(|ui| {
+                menu_layout(ui);
                 if account.is_none() && menu_item(ui, Icon::Edit, "编辑").clicked() {
                     self.ui_state.favorite_draft = Some(FavoriteDraft {
                         original_id: Some(device.id.clone()),

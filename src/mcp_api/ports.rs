@@ -15,7 +15,7 @@ fn set(hub: &Shared, client: &str, id: &str, rule_id: u64, enabled: bool) -> Res
         json!({"op":"port_mapping","id":rule_id,"enabled":enabled,"rule":rule}),
     )?;
     let result = wait_event(hub, client, id, cursor, Duration::from_secs(10), |v| {
-        v["kind"] == "port_status" && v["data"]["id"] == rule_id
+        v["kind"] == "port_status" && v["data"]["id"] == rule_id && v["data"]["scope"] == "listener"
     })?;
     ensure!(
         result["data"]["status"] != "failed",
@@ -32,10 +32,21 @@ fn set(hub: &Shared, client: &str, id: &str, rule_id: u64, enabled: bool) -> Res
         rule["enabled"] = json!(enabled);
         rule["status"] = result["data"]["status"].clone();
     }
+    {
+        let mut h = hub.lock().unwrap();
+        let lease = format!("port:{rule_id}");
+        if enabled {
+            h.retain_resource(client, id, &lease, "port")?;
+        } else {
+            h.release_resource(id, &lease);
+        }
+    }
     Ok(result["data"].clone())
 }
 pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Value> {
     let id = sid(args)?;
+    // A restart must not drop the last connection owner between stop and start.
+    let _lease = ResourceGuard::acquire(hub, client, id, "operation")?;
     let _guard = if name != "uu_port_list" {
         Some(Operation::acquire(hub, id, "ports")?)
     } else {
@@ -174,7 +185,10 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
                 let s = h.ready(client, id)?;
                 let (owner, rule) = s.ports.get(&n).context("映射不存在")?;
                 ensure!(owner == client, "映射属于其他客户端");
-                (rule.clone(), rule["enabled"] == true)
+                (
+                    rule.clone(),
+                    args["enabled"].as_bool().unwrap_or(rule["enabled"] == true),
+                )
             };
             for k in ["name", "local_port", "target_host", "target_port"] {
                 if let Some(v) = args.get(k) {

@@ -157,13 +157,18 @@ pub fn options(device: &str, settings: &Value) -> Vec<u8> {
             max_custom_bitrate: settings["bitrate"].as_i64().unwrap_or(0) as i32,
             ..Default::default()
         }),
-        decoder_cap_list: vec![pb::DecoderCap {
-            fps,
-            codec_type: 1,
-            resolution_width: 3840,
-            resolution_height: 2160,
-            chroma_format: 1,
-        }],
+        decoder_cap_list: [1, 2]
+            .into_iter()
+            .flat_map(|codec_type| {
+                [1, 3].into_iter().map(move |chroma_format| pb::DecoderCap {
+                    fps,
+                    codec_type,
+                    resolution_width: 3840,
+                    resolution_height: 2160,
+                    chroma_format,
+                })
+            })
+            .collect(),
         client_type: 3,
         device_id: device.into(),
         control_connect_type: if settings["assistance"].as_bool().unwrap_or(false) {
@@ -191,9 +196,10 @@ pub fn fps_enum(fps: i32) -> i32 {
 pub fn streamer(control: &str, fps: i64) -> String {
     json!({"control_id":control,"device_capability":{
         "display_info":[{"id":0,"fps":fps,"type":0,"hdr":0}],
-        "video_codec_capability":[{"video_codec":1,"width":3840,"height":2160,"chroma_sampling":1,"bit_depth":8,"codec_impl":37}],
+        "video_codec_capability":super::decoder::profiles(),
         "ice_id":""
-    }}).to_string()
+    }})
+    .to_string()
 }
 
 #[cfg(test)]

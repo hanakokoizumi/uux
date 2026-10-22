@@ -1,4 +1,5 @@
 use super::*;
+use file_columns::{FILE_MIN, FILE_RATIOS, TASK_MIN, TASK_RATIOS};
 
 #[derive(Clone)]
 struct LocalEntry {
@@ -253,12 +254,6 @@ impl Desktop {
                 self.transfer_list(ui);
                 if let Some(error) = &self.error {
                     ui.colored_label(Color32::from_rgb(190, 45, 45), error);
-                } else {
-                    ui.label(
-                        RichText::new(&self.ui_state.last_notice)
-                            .size(11.0)
-                            .color(MUTED),
-                    );
                 }
             });
         self.file_dialog(&ctx);
@@ -304,65 +299,91 @@ impl Desktop {
                             Some(("local_mkdir".into(), self.ui_state.local_path.clone()));
                         self.ui_state.file_name.clear();
                     }
-                    let r = ui.add_sized(
-                        [ui.available_width(), 30.0],
-                        singleline(&mut self.ui_state.local_address).font(egui::TextStyle::Body),
+                    ui.add_space(8.0);
+                    let (r, selected) = address_bar(
+                        ui,
+                        &mut self.ui_state.local_address,
+                        &self.ui_state.local_history,
                     );
+                    if let Some(path) = selected {
+                        self.navigate_local(path, false);
+                    }
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         self.navigate_local(self.ui_state.local_address.clone(), false);
                     }
                 });
             });
-            if file_header(ui, self.ui_state.local_selected.chosen.len(), keys.len()).clicked() {
-                self.ui_state.local_selected.toggle_all(keys);
-                self.ui_state.file_focus_remote = false;
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("local-files")
-                .max_height(height - 94.0)
-                .min_scrolled_height(height - 94.0)
-                .auto_shrink([false, false])
+            let mut columns = self.ui_state.local_columns;
+            let mut layout = columns.layout(ui.available_width(), FILE_RATIOS, FILE_MIN);
+            let top = ui.cursor().top();
+            egui::ScrollArea::horizontal()
+                .id_salt("local-columns")
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    if let Some(error) = &self.ui_state.local_cache.error {
-                        ui.colored_label(MUTED, error);
+                    ui.set_width(layout.width());
+                    if file_header(
+                        ui,
+                        self.ui_state.local_selected.chosen.len(),
+                        keys.len(),
+                        &mut columns,
+                        &mut layout,
+                    )
+                    .clicked()
+                    {
+                        self.ui_state.local_selected.toggle_all(keys);
+                        self.ui_state.file_focus_remote = false;
                     }
-                    for row in self.ui_state.local_cache.entries.clone() {
-                        let key = row.path.to_string_lossy().into_owned();
-                        let r = file_row(
-                            ui,
-                            &row.name,
-                            row.directory,
-                            row.size,
-                            row.modified,
-                            self.ui_state.local_selected.chosen.contains(&key),
-                        );
-                        if r.clicked() {
-                            let mods = ui.input(|i| i.modifiers);
-                            let check = r
-                                .interact_pointer_pos()
-                                .is_some_and(|p| p.x < r.rect.left() + 31.0);
-                            self.ui_state
-                                .local_selected
-                                .click(&key, keys, mods.ctrl, mods.shift, check);
-                        }
-                        if r.double_clicked() && row.directory {
-                            self.navigate_local(key.clone(), false);
-                        }
-                        if r.secondary_clicked() {
-                            self.ui_state.local_selected.context(&key);
-                        }
-                        r.context_menu(|ui| {
-                            if ui.button("发送到远端").clicked() {
-                                self.send_selected(false);
-                                ui.close();
+                    egui::ScrollArea::vertical()
+                        .id_salt("local-files")
+                        .max_height(height - 110.0)
+                        .min_scrolled_height(height - 110.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if let Some(error) = &self.ui_state.local_cache.error {
+                                ui.colored_label(MUTED, error);
                             }
-                            if ui.button("全选").clicked() {
-                                self.ui_state.local_selected.all(keys);
-                                ui.close();
+                            for row in self.ui_state.local_cache.entries.clone() {
+                                let key = row.path.to_string_lossy().into_owned();
+                                let r = file_row(
+                                    ui,
+                                    &layout,
+                                    &row.name,
+                                    row.directory,
+                                    row.size,
+                                    row.modified,
+                                    self.ui_state.local_selected.chosen.contains(&key),
+                                );
+                                if r.clicked() {
+                                    let mods = ui.input(|i| i.modifiers);
+                                    let check = r
+                                        .interact_pointer_pos()
+                                        .is_some_and(|p| p.x < r.rect.left() + 31.0);
+                                    self.ui_state
+                                        .local_selected
+                                        .click(&key, keys, mods.ctrl, mods.shift, check);
+                                }
+                                if r.double_clicked() && row.directory {
+                                    self.navigate_local(key.clone(), false);
+                                }
+                                if r.secondary_clicked() {
+                                    self.ui_state.local_selected.context(&key);
+                                }
+                                r.context_menu(|ui| {
+                                    menu_layout(ui);
+                                    if menu_item(ui, Icon::Transfer, "发送到远端").clicked() {
+                                        self.send_selected(false);
+                                        ui.close();
+                                    }
+                                    if menu_item(ui, Icon::All, "全选").clicked() {
+                                        self.ui_state.local_selected.all(keys);
+                                        ui.close();
+                                    }
+                                });
                             }
                         });
-                    }
                 });
+            self.ui_state.local_columns = columns;
+            ui.add_space((top + height - 66.0 - ui.cursor().top()).max(0.0));
             pane_footer(
                 ui,
                 keys.len(),
@@ -404,85 +425,126 @@ impl Desktop {
                             Some(("mkdir".into(), self.ui_state.remote_path.clone()));
                         self.ui_state.file_name.clear();
                     }
-                    let r = ui.add_sized(
-                        [ui.available_width(), 30.0],
-                        singleline(&mut self.ui_state.remote_address).font(egui::TextStyle::Body),
+                    ui.add_space(8.0);
+                    let (r, selected) = address_bar(
+                        ui,
+                        &mut self.ui_state.remote_address,
+                        &self.ui_state.remote_history,
                     );
+                    if let Some(path) = selected {
+                        self.navigate_remote(path, false);
+                    }
                     if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         self.navigate_remote(self.ui_state.remote_address.clone(), false);
                     }
                 });
             });
-            if file_header(ui, self.ui_state.remote_selected.chosen.len(), keys.len()).clicked() {
-                self.ui_state.remote_selected.toggle_all(keys);
-                self.ui_state.file_focus_remote = true;
-            }
-            egui::ScrollArea::vertical()
-                .id_salt("remote-files")
-                .max_height(height - 94.0)
-                .min_scrolled_height(height - 94.0)
-                .auto_shrink([false, false])
+            let mut columns = self.ui_state.remote_columns;
+            let mut layout = columns.layout(ui.available_width(), FILE_RATIOS, FILE_MIN);
+            let top = ui.cursor().top();
+            egui::ScrollArea::horizontal()
+                .id_salt("remote-columns")
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for row in self.ui_state.entries.clone() {
-                        let dir = [0, 2, 3].contains(&row["kind"].as_i64().unwrap_or(4));
-                        let key = self.remote_entry_path(&row);
-                        let selectable = [0, 4].contains(&row["kind"].as_i64().unwrap_or(-1));
-                        let r = file_row(
-                            ui,
-                            row["name"].as_str().unwrap_or(""),
-                            dir,
-                            row["size"].as_u64().unwrap_or(0),
-                            row["modified"].as_u64().unwrap_or(0),
-                            self.ui_state.remote_selected.chosen.contains(&key),
-                        );
-                        if r.clicked() && selectable {
-                            let mods = ui.input(|i| i.modifiers);
-                            let check = r
-                                .interact_pointer_pos()
-                                .is_some_and(|p| p.x < r.rect.left() + 31.0);
-                            self.ui_state
-                                .remote_selected
-                                .click(&key, keys, mods.ctrl, mods.shift, check);
-                        }
-                        if r.double_clicked() && dir {
-                            self.navigate_remote(key.clone(), false);
-                        }
-                        if r.secondary_clicked() && selectable {
-                            self.ui_state.remote_selected.context(&key);
-                        }
-                        r.context_menu(|ui| {
-                            if ui
-                                .add_enabled(selectable, egui::Button::new("发送到本机"))
-                                .clicked()
-                            {
-                                self.send_selected(true);
-                                ui.close();
-                            }
-                            if ui.button("全选").clicked() {
-                                self.ui_state.remote_selected.all(keys);
-                                ui.close();
-                            }
-                            ui.separator();
-                            let single =
-                                selectable && self.ui_state.remote_selected.chosen.len() == 1;
-                            if ui
-                                .add_enabled(single, egui::Button::new("重命名"))
-                                .clicked()
-                            {
-                                self.ui_state.file_dialog = Some(("rename".into(), key.clone()));
-                                self.ui_state.file_name = row["name"].as_str().unwrap_or("").into();
-                                ui.close();
-                            }
-                            if ui.add_enabled(single, egui::Button::new("删除")).clicked() {
-                                self.ui_state.file_dialog = Some((
-                                    if dir { "remove_dir" } else { "remove_file" }.into(),
-                                    key.clone(),
-                                ));
-                                ui.close();
+                    ui.set_width(layout.width());
+                    if file_header(
+                        ui,
+                        self.ui_state.remote_selected.chosen.len(),
+                        keys.len(),
+                        &mut columns,
+                        &mut layout,
+                    )
+                    .clicked()
+                    {
+                        self.ui_state.remote_selected.toggle_all(keys);
+                        self.ui_state.file_focus_remote = true;
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("remote-files")
+                        .max_height(height - 110.0)
+                        .min_scrolled_height(height - 110.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for row in self.ui_state.entries.clone() {
+                                let dir = [0, 2, 3].contains(&row["kind"].as_i64().unwrap_or(4));
+                                let key = self.remote_entry_path(&row);
+                                let selectable =
+                                    [0, 4].contains(&row["kind"].as_i64().unwrap_or(-1));
+                                let r = file_row(
+                                    ui,
+                                    &layout,
+                                    row["name"].as_str().unwrap_or(""),
+                                    dir,
+                                    row["size"].as_u64().unwrap_or(0),
+                                    row["modified"].as_u64().unwrap_or(0),
+                                    self.ui_state.remote_selected.chosen.contains(&key),
+                                );
+                                if r.clicked() && selectable {
+                                    let mods = ui.input(|i| i.modifiers);
+                                    let check = r
+                                        .interact_pointer_pos()
+                                        .is_some_and(|p| p.x < r.rect.left() + 31.0);
+                                    self.ui_state
+                                        .remote_selected
+                                        .click(&key, keys, mods.ctrl, mods.shift, check);
+                                }
+                                if r.double_clicked() && dir {
+                                    self.navigate_remote(key.clone(), false);
+                                }
+                                if r.secondary_clicked() && selectable {
+                                    self.ui_state.remote_selected.context(&key);
+                                }
+                                r.context_menu(|ui| {
+                                    menu_layout(ui);
+                                    if ui
+                                        .add_enabled_ui(selectable, |ui| {
+                                            menu_item(ui, Icon::Transfer, "发送到本机")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.send_selected(true);
+                                        ui.close();
+                                    }
+                                    if menu_item(ui, Icon::All, "全选").clicked() {
+                                        self.ui_state.remote_selected.all(keys);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    let single = selectable
+                                        && self.ui_state.remote_selected.chosen.len() == 1;
+                                    if ui
+                                        .add_enabled_ui(single, |ui| {
+                                            menu_item(ui, Icon::Edit, "重命名")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.ui_state.file_dialog =
+                                            Some(("rename".into(), key.clone()));
+                                        self.ui_state.file_name =
+                                            row["name"].as_str().unwrap_or("").into();
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .add_enabled_ui(single, |ui| {
+                                            menu_item(ui, Icon::Trash, "删除")
+                                        })
+                                        .inner
+                                        .clicked()
+                                    {
+                                        self.ui_state.file_dialog = Some((
+                                            if dir { "remove_dir" } else { "remove_file" }.into(),
+                                            key.clone(),
+                                        ));
+                                        ui.close();
+                                    }
+                                });
                             }
                         });
-                    }
                 });
+            self.ui_state.remote_columns = columns;
+            ui.add_space((top + height - 66.0 - ui.cursor().top()).max(0.0));
             pane_footer(
                 ui,
                 self.ui_state.entries.len(),
@@ -537,38 +599,41 @@ impl Desktop {
     fn transfer_list(&mut self, ui: &mut egui::Ui) {
         file_panel().show(ui,|ui| {
             ui.set_width(ui.available_width());
-            egui::Frame::new().inner_margin(10).show(ui,|ui| {
+            egui::Frame::new().inner_margin(egui::Margin::symmetric(10, 7)).show(ui,|ui| {
                 ui.horizontal(|ui| {
                     ui.label("传输列表");
                     ui.label(RichText::new(format!("已传输 {} 项",self.ui_state.transfers.iter().filter(|t|t["status"]=="已完成").count())).size(11.0).color(MUTED));
                     let active=self.ui_state.transfers.iter().any(transfer_active);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        if transfer_toolbar_button(ui,"清除完结任务",true).clicked(){self.ui_state.transfers.retain(transfer_active);self.ui_state.transfer_rates.retain(&self.ui_state.transfers);}
-                        if transfer_toolbar_button(ui,"全部取消",active).clicked(){self.control(json!({"op":"transfers_cancel"}));}
+                        if transfer_toolbar_button(ui,Icon::Trash,"清除完结任务",true).clicked(){self.ui_state.transfers.retain(transfer_active);self.ui_state.transfer_rates.retain(&self.ui_state.transfers);}
+                        if transfer_toolbar_button(ui,Icon::Close,"全部取消",active).clicked(){self.control(json!({"op":"transfers_cancel"}));}
                         for (label,paused) in [("全部开始",false),("全部暂停",true)] {
-                            if transfer_toolbar_button(ui,label,active).clicked(){self.control(json!({"op":"transfers_pause","paused":paused}));}
+                            if transfer_toolbar_button(ui,if paused { Icon::Pause } else { Icon::Play },label,active).clicked(){self.control(json!({"op":"transfers_pause","paused":paused}));}
                         }
                     });
                 });
             });
             ui.separator();
-            let columns=TRANSFER_COLUMNS;
-            let (head,_)=ui.allocate_exact_size(Vec2::new(ui.available_width(),28.0),egui::Sense::hover());
-            for (i,name) in ["名称","状态 / 进度 / 速度","大小","发送路径","接收路径","操作"].iter().enumerate(){cell(ui,head,columns[i],name,MUTED,12.0);}
-            egui::ScrollArea::vertical().id_salt("transfers").max_height((ui.available_height()-25.0).max(70.0)).min_scrolled_height(65.0).auto_shrink([false,false]).show(ui,|ui| {
+            let mut columns = self.ui_state.task_columns;
+            let mut layout = columns.layout(ui.available_width(), TASK_RATIOS, TASK_MIN);
+            egui::ScrollArea::horizontal().id_salt("task-columns").auto_shrink([false, true]).show(ui, |ui| {
+            ui.set_width(layout.width());
+            let head = columns.header(ui, &mut layout, TASK_MIN);
+            for (i,name) in ["名称","状态","大小","发送路径","接收路径","操作"].iter().enumerate(){cell(ui,layout.cell(head,i),name,MUTED,13.0);}
+            egui::ScrollArea::vertical().id_salt("transfers").max_height((ui.available_height()-41.0).max(70.0)).min_scrolled_height(65.0).auto_shrink([false,false]).show(ui,|ui| {
                 for t in self.ui_state.transfers.clone(){
-                    let (r,row)=ui.allocate_exact_size(Vec2::new(ui.available_width(),34.0),egui::Sense::hover());
+                    let (r,row)=ui.allocate_exact_size(Vec2::new(layout.width(),34.0),egui::Sense::hover());
                     let status=t["status"].as_str().unwrap_or("");
-                    cell(ui,r,0.0,t["name"].as_str().unwrap_or(""),INK,13.0);
+                    cell(ui,layout.cell(r,0),t["name"].as_str().unwrap_or(""),INK,13.0);
                     let speed=transfer_progress::speed_text(self.ui_state.transfer_rates.bytes_per_second(&t,Instant::now()));
-                    transfer_status(ui,r,&t,&speed);
-                    cell(ui,r,0.51,&if t["directory"]==true{"文件夹".into()}else{size_text(t["size"].as_u64().unwrap_or(0))},INK,12.0);
+                    transfer_status(ui,layout.cell(r,1),&t,&speed);
+                    cell(ui,layout.cell(r,2),&if t["directory"]==true{"文件夹".into()}else{size_text(t["size"].as_u64().unwrap_or(0))},INK,12.0);
                     let upload=t["upload"].as_bool().unwrap_or(false);
-                    cell(ui,r,0.63,t[if upload{"local"}else{"remote"}].as_str().unwrap_or(""),MUTED,11.0);
-                    cell(ui,r,0.755,t[if upload{"remote"}else{"local"}].as_str().unwrap_or(""),MUTED,11.0);
+                    cell(ui,layout.cell(r,3),t[if upload{"local"}else{"remote"}].as_str().unwrap_or(""),MUTED,11.0);
+                    cell(ui,layout.cell(r,4),t[if upload{"remote"}else{"local"}].as_str().unwrap_or(""),MUTED,11.0);
                     row.on_hover_text(format!("{}\n{} → {}\n{} · {} · {}\n已传输 {} / {}{}",t["name"].as_str().unwrap_or(""),t[if upload{"local"}else{"remote"}].as_str().unwrap_or(""),t[if upload{"remote"}else{"local"}].as_str().unwrap_or(""),status,transfer_progress::percentage(&t),speed,size_text(t["done"].as_u64().unwrap_or(0)),if t["directory"]==true{"文件夹进度见子文件".into()}else{size_text(t["size"].as_u64().unwrap_or(0))},t["error"].as_str().map(|e|format!("\n{e}")).unwrap_or_default()));
-                    let action=egui::Rect::from_min_max(egui::pos2(r.left()+r.width()*0.89,r.top()),r.max);
+                    let action=layout.cell(r,5);
                     ui.scope_builder(egui::UiBuilder::new().max_rect(action),|ui| {
                         ui.spacing_mut().item_spacing.x=2.0;
                         ui.horizontal(|ui| {
@@ -584,47 +649,69 @@ impl Desktop {
                     });
                 }
             });
+            });
+            self.ui_state.task_columns = columns;
         });
     }
     fn file_dialog(&mut self, ctx: &egui::Context) {
         let Some((op, path)) = self.ui_state.file_dialog.clone() else {
             return;
         };
-        let mut open = true;
-        dialog(if op.starts_with("remove_"){"删除项目"}else if op.ends_with("mkdir"){"新建文件夹"}else{"重命名"})
-            .open(&mut open).collapsible(false).resizable(false)
-            .show(ctx,|ui| {
-                ui.set_max_width(420.0);ui.label(&path);
-                if op.starts_with("remove_"){ui.label("所选项目及其内容将被删除。");}
-                else{ui.add_sized([ui.available_width(),30.0],singleline(&mut self.ui_state.file_name));}
-                ui.add_space(16.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
-                    if ui.add_enabled_ui(op.starts_with("remove_") || !self.ui_state.file_name.is_empty(),|ui|art::primary(ui,"确定",Vec2::new(88.0,30.0))).inner.clicked(){
-                        let name=&self.ui_state.file_name;
-                        if op.starts_with("remove_"){self.control(json!({"op":op,"path":path,"recursive":op=="remove_dir"}));}
-                        else if let Err(e)=crate::core::files::safe_name(name){self.error=Some(e.to_string());}
-                        else if op=="local_mkdir"{
-                            if let Err(e)=std::fs::create_dir(PathBuf::from(&path).join(name)){self.error=Some(format!("无法创建文件夹：{e}"));}
-                            self.ui_state.local_cache.scanned=None;
-                        }
-                        else{self.control(json!({"op":op,"path":if op=="mkdir"{format!("{}\\{}",path.trim_end_matches('\\'),name)}else{path},"name":name}));}
-                        self.ui_state.file_dialog=None;
+        let response = modal(ctx, "file-operation", |ui| {
+            modal_body(
+                ui,
+                if op.starts_with("remove_") {
+                    "删除项目"
+                } else if op.ends_with("mkdir") {
+                    "新建文件夹"
+                } else {
+                    "重命名"
+                },
+                |ui| {
+                    ui.label(RichText::new(&path).size(12.0).color(MUTED));
+                    if op.starts_with("remove_") {
+                        ui.label("所选项目及其内容将被删除。");
+                    } else {
+                        ui.add_sized([398.0, 32.0], singleline(&mut self.ui_state.file_name));
                     }
-                    if ui.add_sized([88.0,30.0],egui::Button::new("取消")).clicked(){self.ui_state.file_dialog=None;}
-                });
-            });
-        if !open {
+                },
+            );
+            modal_actions(
+                ui,
+                "确定",
+                op.starts_with("remove_") || !self.ui_state.file_name.is_empty(),
+                "取消",
+            )
+        });
+        if response.inner.0 {
+            let name = &self.ui_state.file_name;
+            if op.starts_with("remove_") {
+                self.control(json!({"op":op,"path":path,"recursive":op=="remove_dir"}));
+            } else if let Err(e) = crate::core::files::safe_name(name) {
+                self.error = Some(e.to_string());
+            } else if op == "local_mkdir" {
+                if let Err(e) = std::fs::create_dir(PathBuf::from(&path).join(name)) {
+                    self.error = Some(format!("无法创建文件夹：{e}"));
+                }
+                self.ui_state.local_cache.scanned = None;
+            } else {
+                self.control(json!({"op":op,"path":if op=="mkdir"{format!("{}\\{}",path.trim_end_matches('\\'),name)}else{path},"name":name}));
+            }
+            self.ui_state.file_dialog = None;
+        } else if response.inner.1 || response.should_close() {
             self.ui_state.file_dialog = None;
         }
     }
 }
 
-fn transfer_toolbar_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+fn transfer_toolbar_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
     ui.add_enabled_ui(enabled, |ui| {
-        ui.add_sized(
-            Vec2::new(116.0, 28.0),
-            egui::Button::new(RichText::new(label).size(13.0)),
-        )
+        art::icon_label(ui, icon, label, Vec2::new(116.0, 28.0))
     })
     .inner
 }
@@ -677,6 +764,54 @@ fn send_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response 
         .inner
         .on_hover_text("发送选中的文件和文件夹（Ctrl+Enter）")
 }
+fn address_bar(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    history: &[String],
+) -> (egui::Response, Option<String>) {
+    let edit = ui.add_sized(
+        [ui.available_width(), 32.0],
+        singleline(value)
+            .font(egui::TextStyle::Body)
+            .margin(egui::Margin {
+                left: 10,
+                right: 30,
+                top: 5,
+                bottom: 5,
+            }),
+    );
+    let rect = egui::Rect::from_center_size(
+        edit.rect.right_center() - Vec2::new(16.0, 0.0),
+        Vec2::new(28.0, 28.0),
+    );
+    let button = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            art::sized_icon_button(ui, Icon::Down, "历史路径", rect.size())
+        })
+        .inner;
+    let mut selected = None;
+    egui::Popup::menu(&button).show(|ui| {
+        menu_layout(ui);
+        let mut seen = BTreeSet::new();
+        for path in std::iter::once(&*value)
+            .chain(history.iter().rev())
+            .take(20)
+        {
+            if !path.is_empty()
+                && seen.insert(path.clone())
+                && ui
+                    .add_sized([MENU_WIDTH, 30.0], egui::Button::new(path).truncate())
+                    .on_hover_text(path)
+                    .clicked()
+            {
+                selected = Some(path.clone());
+                ui.close();
+            }
+        }
+    });
+    (edit, selected)
+}
+
 fn pane_footer(ui: &mut egui::Ui, total: usize, selected: usize, loading: bool) {
     let (r, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.0), egui::Sense::hover());
@@ -727,9 +862,14 @@ fn checkbox(ui: &egui::Ui, r: egui::Rect, selected: bool, mixed: bool) {
         ));
     }
 }
-fn file_header(ui: &mut egui::Ui, selected: usize, total: usize) -> egui::Response {
-    let (r, _) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.0), egui::Sense::hover());
+fn file_header(
+    ui: &mut egui::Ui,
+    selected: usize,
+    total: usize,
+    columns: &mut file_columns::Columns<4>,
+    layout: &mut file_columns::Layout<4>,
+) -> egui::Response {
+    let r = columns.header(ui, layout, FILE_MIN);
     let box_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 17.0, r.center().y), Vec2::splat(14.0));
     let response = ui.interact(
@@ -744,25 +884,15 @@ fn file_header(ui: &mut egui::Ui, selected: usize, total: usize) -> egui::Respon
         total > 0 && selected == total,
         selected > 0 && selected < total,
     );
-    for (x, name) in [
-        (r.left() + 33.0, "名称"),
-        (r.left() + r.width() * 0.29 + 10.0, "修改日期"),
-        (r.left() + r.width() * 0.62 + 10.0, "类型"),
-        (r.left() + r.width() * 0.77 + 10.0, "大小"),
-    ] {
-        ui.painter().text(
-            egui::pos2(x, r.center().y),
-            egui::Align2::LEFT_CENTER,
-            name,
-            egui::FontId::proportional(12.0),
-            MUTED,
-        );
+    for (index, name) in ["名称", "修改日期", "类型", "大小"].iter().enumerate() {
+        let mut rect = layout.cell(r, index);
+        if index == 0 {
+            rect.min.x += 23.0;
+        }
+        cell(ui, rect, name, MUTED, 13.0);
     }
-    ui.painter()
-        .hline(r.x_range(), r.bottom(), egui::Stroke::new(1.0, BORDER));
     response.on_hover_text("全选 / 取消全选（Ctrl+A）")
 }
-const TRANSFER_COLUMNS: [f32; 6] = [0.0, 0.25, 0.51, 0.63, 0.755, 0.89];
 fn transfer_status(ui: &egui::Ui, rect: egui::Rect, transfer: &Value, speed: &str) {
     let status = transfer["status"].as_str().unwrap_or("");
     let progress = transfer_progress::fraction(transfer);
@@ -784,11 +914,10 @@ fn transfer_status(ui: &egui::Ui, rect: egui::Rect, transfer: &Value, speed: &st
         let mut second = rect;
         second.min.y = rect.top() + 16.0;
         second.max.y = rect.bottom() - 3.0;
-        cell(ui, first, 0.25, &label, color, 12.0);
+        cell(ui, first, &label, color, 12.0);
         cell(
             ui,
             second,
-            0.25,
             if transfer["directory"] == true {
                 "进度见子文件"
             } else {
@@ -798,8 +927,8 @@ fn transfer_status(ui: &egui::Ui, rect: egui::Rect, transfer: &Value, speed: &st
             11.0,
         );
         if let Some(progress) = progress {
-            let start = rect.left() + rect.width() * 0.25 + 10.0;
-            let end = rect.left() + rect.width() * 0.51 - 10.0;
+            let start = rect.left() + 10.0;
+            let end = rect.right() - 10.0;
             let y = rect.bottom() - 1.0;
             ui.painter()
                 .hline(start..=end, y, egui::Stroke::new(2.0, BORDER));
@@ -812,36 +941,28 @@ fn transfer_status(ui: &egui::Ui, rect: egui::Rect, transfer: &Value, speed: &st
             }
         }
     } else {
-        cell(ui, rect, 0.25, &label, color, 12.0);
+        cell(ui, rect, &label, color, 12.0);
     }
 }
 
-fn cell(ui: &egui::Ui, r: egui::Rect, x: f32, text: &str, color: Color32, size: f32) {
-    let remaining = TRANSFER_COLUMNS
-        .iter()
-        .find(|&&v| v > x + 0.001)
-        .copied()
-        .unwrap_or(1.0)
-        - x;
+fn cell(ui: &egui::Ui, r: egui::Rect, text: &str, color: Color32, size: f32) {
     let mut job = egui::text::LayoutJob::simple_singleline(
         text.into(),
         egui::FontId::proportional(size),
         color,
     );
-    job.wrap.max_width = (r.width() * remaining - 12.0).max(10.0);
+    job.wrap.max_width = (r.width() - 16.0).max(0.0);
     job.wrap.max_rows = 1;
     let galley = ui.painter().layout_job(job);
     ui.painter().galley(
-        egui::pos2(
-            r.left() + r.width() * x + 10.0,
-            r.center().y - galley.size().y / 2.0,
-        ),
+        egui::pos2(r.left() + 10.0, r.center().y - galley.size().y / 2.0),
         galley,
         color,
     );
 }
 fn file_row(
     ui: &mut egui::Ui,
+    layout: &file_columns::Layout<4>,
     name: &str,
     dir: bool,
     size: u64,
@@ -849,7 +970,7 @@ fn file_row(
     selected: bool,
 ) -> egui::Response {
     let (r, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), egui::Sense::click());
+        ui.allocate_exact_size(Vec2::new(layout.width(), 36.0), egui::Sense::click());
     if selected || response.hovered() {
         ui.painter().rect_filled(
             r,
@@ -886,21 +1007,9 @@ fn file_row(
         );
     }
     let cells = [
+        (name.to_owned(), INK),
+        (date(time), MUTED),
         (
-            r.left() + 62.0,
-            r.left() + r.width() * 0.29,
-            name.to_owned(),
-            INK,
-        ),
-        (
-            r.left() + r.width() * 0.29 + 10.0,
-            r.left() + r.width() * 0.62,
-            date(time),
-            MUTED,
-        ),
-        (
-            r.left() + r.width() * 0.62 + 10.0,
-            r.left() + r.width() * 0.77,
             if dir {
                 "文件夹".into()
             } else {
@@ -908,24 +1017,14 @@ fn file_row(
             },
             MUTED,
         ),
-        (
-            r.left() + r.width() * 0.77 + 10.0,
-            r.right() - 4.0,
-            if dir { "--".into() } else { size_text(size) },
-            MUTED,
-        ),
+        (if dir { "--".into() } else { size_text(size) }, MUTED),
     ];
-    for (start, end, text, color) in cells {
-        let mut job =
-            egui::text::LayoutJob::simple_singleline(text, egui::FontId::proportional(12.0), color);
-        job.wrap.max_width = (end - start - 5.0).max(10.0);
-        job.wrap.max_rows = 1;
-        let galley = ui.painter().layout_job(job);
-        ui.painter().galley(
-            egui::pos2(start, r.center().y - galley.size().y / 2.0),
-            galley,
-            color,
-        );
+    for (index, (text, color)) in cells.iter().enumerate() {
+        let mut rect = layout.cell(r, index);
+        if index == 0 {
+            rect.min.x += 52.0;
+        }
+        cell(ui, rect, text, *color, 13.0);
     }
     response.on_hover_text(name)
 }
@@ -962,7 +1061,7 @@ mod progress_layout_tests {
 
     #[test]
     fn status_percentage_and_speed_fit_without_overlapping_at_minimum_width() {
-        for width in [824.0, 924.0, 1384.0] {
+        for width in [150.0, 214.0, 360.0] {
             let ctx = egui::Context::default();
             fonts::setup(&ctx);
             let row = egui::Rect::from_min_size(egui::pos2(0.0, 20.0), Vec2::new(width, 34.0));
@@ -994,7 +1093,7 @@ mod progress_layout_tests {
             );
             for (_, rect) in text {
                 assert!(rect.top() >= row.top() && rect.bottom() < row.bottom() - 1.0);
-                assert!(rect.left() >= width * 0.25 && rect.right() < width * 0.51);
+                assert!(rect.left() >= row.left() && rect.right() < row.right());
             }
         }
     }

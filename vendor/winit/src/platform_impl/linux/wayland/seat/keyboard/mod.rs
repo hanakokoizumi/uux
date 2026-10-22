@@ -11,6 +11,7 @@ use sctk::reexports::client::protocol::wl_keyboard::{
     Event as WlKeyboardEvent, KeyState as WlKeyState, KeymapFormat as WlKeymapFormat, WlKeyboard,
 };
 use sctk::reexports::client::protocol::wl_seat::WlSeat;
+use sctk::reexports::client::protocol::wl_surface::WlSurface;
 use sctk::reexports::client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 
 use crate::event::{ElementState, WindowEvent};
@@ -62,6 +63,7 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                 },
             },
             WlKeyboardEvent::Enter { surface, .. } => {
+                *data.surface.lock().unwrap() = Some(surface.clone());
                 let window_id = wayland::make_wid(&surface);
 
                 // Mark the window as focused.
@@ -120,6 +122,7 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                 // We don't need to update it above, because the next `Enter` will overwrite
                 // anyway.
                 *data.window_id.lock().unwrap() = None;
+                *data.surface.lock().unwrap() = None;
 
                 if !focused {
                     // Notify that no modifiers are being pressed.
@@ -131,7 +134,10 @@ impl Dispatch<WlKeyboard, KeyboardData, WinitState> for WinitState {
                     state.events_sink.push_window_event(WindowEvent::Focused(false), window_id);
                 }
             },
-            WlKeyboardEvent::Key { key, state: WEnum::Value(WlKeyState::Pressed), .. } => {
+            WlKeyboardEvent::Key { key, serial, state: WEnum::Value(WlKeyState::Pressed), .. } => {
+                if let (Some(activation), Some(surface)) = (&state.xdg_activation, data.surface.lock().unwrap().as_ref()) {
+                    activation.input.record(surface, &data.seat, serial);
+                }
                 let key = key + 8;
 
                 key_input(
@@ -347,6 +353,7 @@ impl Default for RepeatInfo {
 pub struct KeyboardData {
     /// The currently focused window surface. Could be `None` on bugged compositors, like mutter.
     window_id: Mutex<Option<WindowId>>,
+    surface: Mutex<Option<WlSurface>>,
 
     /// The seat used to create this keyboard.
     seat: WlSeat,
@@ -354,7 +361,7 @@ pub struct KeyboardData {
 
 impl KeyboardData {
     pub fn new(seat: WlSeat) -> Self {
-        Self { window_id: Default::default(), seat }
+        Self { window_id: Default::default(), surface: Default::default(), seat }
     }
 }
 

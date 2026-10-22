@@ -31,7 +31,7 @@ use crate::window::{
 use super::event_loop::sink::EventSink;
 use super::output::MonitorHandle;
 use super::state::WinitState;
-use super::types::xdg_activation::XdgActivationTokenData;
+use super::types::xdg_activation::{ActivationInput, XdgActivationTokenData};
 use super::{ActiveEventLoop, WaylandError, WindowId};
 
 pub(crate) mod state;
@@ -58,6 +58,7 @@ pub struct Window {
 
     /// Xdg activation to request user attention.
     xdg_activation: Option<XdgActivationV1>,
+    activation_input: ActivationInput,
 
     /// The state of the requested attention from the `xdg_activation`.
     attention_requested: Arc<AtomicBool>,
@@ -92,6 +93,8 @@ impl Window {
         let compositor = state.compositor_state.clone();
         let xdg_activation =
             state.xdg_activation.as_ref().map(|activation_state| activation_state.global().clone());
+        let activation_input = state.xdg_activation.as_ref()
+            .map(|activation| activation.input.clone()).unwrap_or_default();
         let display = event_loop_window_target.connection.display();
 
         let size: Size = attributes.inner_size.unwrap_or(LogicalSize::new(800., 600.).into());
@@ -225,6 +228,7 @@ impl Window {
             window_state,
             queue_handle,
             xdg_activation,
+            activation_input,
             attention_requested: Arc::new(AtomicBool::new(false)),
             event_loop_awakener,
             window_requests,
@@ -629,7 +633,18 @@ impl Window {
     }
 
     #[inline]
-    pub fn focus_window(&self) {}
+    pub fn focus_window(&self) {
+        let Some(activation) = &self.xdg_activation else { return; };
+        let token = activation.get_activation_token(
+            &self.queue_handle, XdgActivationTokenData::Focus(self.surface().clone()),
+        );
+        if self.activation_input.apply(&token) {
+            token.commit();
+            self.event_loop_awakener.ping();
+        } else {
+            token.destroy();
+        }
+    }
 
     #[inline]
     pub fn surface(&self) -> &WlSurface {

@@ -43,9 +43,6 @@ impl Draft {
         Ok(rule)
     }
 }
-pub(super) fn viewport_id() -> egui::ViewportId {
-    crate::backend::ports_viewport_id()
-}
 impl Desktop {
     pub(super) fn port_status(&mut self, data: Value) {
         if let Some(id) = data["id"].as_u64() {
@@ -53,9 +50,7 @@ impl Desktop {
         }
     }
     pub(super) fn open_ports_for(&mut self, device: Device) {
-        if !self.connected && !self.connecting {
-            self.connect_for_tools(device);
-        }
+        self.connect_for_tools(device);
         self.ui_state.windows.ports = true;
     }
     fn change_port(&mut self, rule: &RuleConfig, enabled: bool) {
@@ -85,14 +80,17 @@ impl Desktop {
             return;
         }
         ctx.show_viewport_immediate(
-            viewport_id(),
+            self.viewport("ports"),
             egui::ViewportBuilder::default()
+                .with_icon(crate::brand::icon())
                 .with_title("端口映射 — UUX")
                 .with_inner_size([920.0, 680.0])
                 .with_min_inner_size([800.0, 480.0])
                 .with_decorations(false)
                 .with_resizable(true),
             |ui, _| {
+                // Cover the entire undecorated viewport, including space between panels.
+                ui.painter().rect_filled(ui.max_rect(), 0, SIDE);
                 let resizing = self.ui_state.ports.resize.intercept(
                     ui.ctx(),
                     self.ui_state.ports.draft.is_none() && !self.ui_state.ports.confirm_close,
@@ -116,11 +114,25 @@ impl Desktop {
                             if !resizing && response.drag_started() {
                                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
                             }
-                            if art::flat_button(ui, "−", Vec2::new(32.0, 24.0)).clicked() {
+                            if art::sized_icon_button(
+                                ui,
+                                Icon::Minimize,
+                                "最小化",
+                                Vec2::new(32.0, 24.0),
+                            )
+                            .clicked()
+                            {
                                 ui.ctx()
                                     .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                             }
-                            if art::flat_button(ui, "×", Vec2::new(32.0, 24.0)).clicked() {
+                            if art::sized_icon_button(
+                                ui,
+                                Icon::Close,
+                                "关闭",
+                                Vec2::new(32.0, 24.0),
+                            )
+                            .clicked()
+                            {
                                 close = true;
                             }
                         });
@@ -151,22 +163,20 @@ impl Desktop {
                     .show(ui, |ui| self.port_list(ui));
                 self.port_dialog(ui.ctx());
                 if self.ui_state.ports.confirm_close {
-                    egui::Modal::new(egui::Id::unique("port-close")).show(ui.ctx(), |ui| {
-                        ui.set_width(360.0);
-                        ui.label("关闭端口映射窗口将停止所有已启用的映射。");
-                        ui.add_space(16.0);
-                        ui.horizontal(|ui| {
-                            if primary(ui, "关闭并停止").clicked() {
-                                self.close_ports();
-                            }
-                            if ui.button("取消").clicked() {
-                                self.ui_state.ports.confirm_close = false;
-                            }
+                    let response = modal(ui.ctx(), "port-close", |ui| {
+                        modal_body(ui, "关闭端口映射", |ui| {
+                            ui.label("关闭端口映射窗口将停止所有已启用的映射。");
                         });
+                        modal_actions(ui, "关闭并停止", true, "取消")
                     });
+                    if response.inner.0 {
+                        self.close_ports();
+                    } else if response.inner.1 || response.should_close() {
+                        self.ui_state.ports.confirm_close = false;
+                    }
                 }
                 self.ui_state.ports.resize.paint_cursor(ui.ctx());
-                self.diagnostics(ui.ctx());
+                self.capture_window(ui.ctx());
             },
         );
     }
@@ -352,6 +362,7 @@ impl Desktop {
                                     egui::Button::new("···").frame(false),
                                 );
                                 egui::Popup::menu(&menu).show(|ui| {
+                                    menu_layout(ui);
                                     if menu_item(ui, Icon::Edit, "编辑").clicked() {
                                         self.ui_state.ports.draft =
                                             Some(Draft::from_rule(rule.clone()));
@@ -392,41 +403,53 @@ impl Desktop {
             .any(|r| r.id == draft.id);
         let mut save = false;
         let mut cancel = false;
-        let response = egui::Modal::new(egui::Id::unique("port-rule-editor")).show(ctx, |ui| {
-            ui.set_width(400.0);
-            ui.label(
-                RichText::new(if editing {
+        let response = modal(ctx, "port-rule-editor", |ui| {
+            modal_body(
+                ui,
+                if editing {
                     "编辑端口映射"
                 } else {
                     "添加端口映射"
-                })
-                .size(16.0),
-            );
-            ui.add_space(18.0);
-            egui::Grid::new("port-rule-fields")
-                .spacing([20.0, 16.0])
-                .show(ui, |ui| {
-                    for (label, text, hint) in [
-                        ("名称", &mut draft.name, "映射名称"),
-                        ("本地端口", &mut draft.local, "1–65535"),
-                        ("目标地址", &mut draft.host, "127.0.0.1"),
-                        ("目标端口", &mut draft.port, "1–65535"),
-                    ] {
-                        ui.label(label);
-                        ui.add_sized([280.0, 32.0], singleline(text).hint_text(hint));
-                        ui.end_row();
+                },
+                |ui| {
+                    egui::Grid::new("port-rule-fields")
+                        .spacing([20.0, 16.0])
+                        .show(ui, |ui| {
+                            for (label, text, hint) in [
+                                ("名称", &mut draft.name, "映射名称"),
+                                ("本地端口", &mut draft.local, "1–65535"),
+                                ("目标地址", &mut draft.host, "127.0.0.1"),
+                                ("目标端口", &mut draft.port, "1–65535"),
+                            ] {
+                                let (rect, response) = ui.allocate_exact_size(
+                                    Vec2::new(80.0, 32.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().text(
+                                    rect.left_center(),
+                                    egui::Align2::LEFT_CENTER,
+                                    label,
+                                    egui::FontId::proportional(13.0),
+                                    INK,
+                                );
+                                response.widget_info(|| {
+                                    egui::WidgetInfo::labeled(egui::Role::Label, true, label)
+                                });
+                                ui.add_sized([298.0, 32.0], singleline(text).hint_text(hint));
+                                ui.end_row();
+                            }
+                        });
+                    if let Some(error) = &draft.error {
+                        ui.colored_label(Color32::from_rgb(200, 60, 60), error);
                     }
-                });
-            if let Some(error) = &draft.error {
-                ui.colored_label(Color32::from_rgb(200, 60, 60), error);
-            }
-            ui.add_space(24.0);
-            ui.horizontal(|ui| {
-                save = primary(ui, if editing { "保存更改" } else { "添加" }).clicked();
-                cancel = ui
-                    .add_sized([112.0, 30.0], egui::Button::new("取消"))
-                    .clicked();
-            });
+                },
+            );
+            (save, cancel) = modal_actions(
+                ui,
+                if editing { "保存更改" } else { "添加" },
+                draft.rule().is_ok(),
+                "取消",
+            );
         });
         if save {
             let result = draft.rule().and_then(|rule| {

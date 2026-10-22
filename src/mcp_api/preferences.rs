@@ -127,3 +127,94 @@ pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Valu
         _ => bail!("未知设置操作"),
     }
 }
+
+pub fn power(hub: &Shared, client: &str, args: &Value) -> Result<Value> {
+    let device = str_arg(args, "device_id")?;
+    let action = str_arg(args, "action")?;
+    ensure!(
+        ["shutdown", "restart", "wake"].contains(&action),
+        "电源动作无效"
+    );
+    if action == "wake" {
+        let request = uid();
+        let cursor = {
+            let h = hub.lock().unwrap();
+            h.account.send(json!({"op":"device_action","request_id":request,"device_id":device,"action":"wake"})).map_err(anyhow::Error::msg)?;
+            h.account_events.seq
+        };
+        let start = Instant::now();
+        loop {
+            {
+                let h = hub.lock().unwrap();
+                for row in h.account_events.since(cursor) {
+                    let event = &row["event"];
+                    if event["kind"] == "device_action_result"
+                        && event["data"]["request_id"] == request
+                    {
+                        ensure!(event["data"]["ok"] == true, "{}", event["data"]["message"]);
+                        return Ok(
+                            json!({"device_id":device,"action":action,"submitted":true,"completed":false,"confirmation":"official_cloud_accepted","next":"uu_devices_list observes online state"}),
+                        );
+                    }
+                }
+            }
+            ensure!(
+                start.elapsed() < Duration::from_secs(20),
+                "官方唤醒请求超时"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let temporary = args.get("session_id").is_none();
+    let attached_before = hub
+        .lock()
+        .unwrap()
+        .clients
+        .get(client)
+        .context("客户端已退出")?
+        .sessions
+        .clone();
+    let session = if temporary {
+        hub.lock().unwrap().open(
+            client,
+            &json!({"device_id":device,"settings":{"wait_for_video":false}}),
+        )?
+    } else {
+        str_arg(args, "session_id")?.to_owned()
+    };
+    let result = (|| {
+        let start = Instant::now();
+        loop {
+            let h = hub.lock().unwrap();
+            let s = h.owner(client, &session)?;
+            ensure!(
+                s.device_id.as_deref() == Some(device) || s.target == device,
+                "session_id 与目标设备不符"
+            );
+            ensure!(!s.ended && !s.closing, "连接已结束");
+            if s.ready {
+                break;
+            }
+            drop(h);
+            ensure!(
+                start.elapsed() < Duration::from_secs(30),
+                "等待电源操作通道超时"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let _lease = ResourceGuard::acquire(hub, client, &session, "operation")?;
+        submit(
+            hub,
+            client,
+            &session,
+            json!({"op":"action","action":if action=="shutdown" {12}else{9}}),
+        )?;
+        Ok(
+            json!({"device_id":device,"session_id":session,"action":action,"submitted":true,"completed":false,"confirmation":"native_control_channel_sent"}),
+        )
+    })();
+    if temporary && !attached_before.contains(&session) {
+        hub.lock().unwrap().release(client, &session);
+    }
+    result
+}

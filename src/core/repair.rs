@@ -50,7 +50,7 @@ impl RTPReader for Reader {
             self.recovered.fetch_add(1, Ordering::Relaxed);
         }
         // This stream is already protected by DTLS/SRTP. Backpressure is bounded.
-        let _ = self.tx.send(copy).await;
+        let _ = self.tx.try_send(copy);
         Ok((packet, attrs))
     }
 }
@@ -77,7 +77,10 @@ impl Interceptor for Repair {
     }
     async fn unbind_local_stream(&self, _: &StreamInfo) {}
     async fn unbind_remote_stream(&self, info: &StreamInfo) {
-        if info.associated_stream.is_none() && info.mime_type.eq_ignore_ascii_case("video/h264") {
+        if info.associated_stream.is_none()
+            && (info.mime_type.eq_ignore_ascii_case("video/h264")
+                || info.mime_type.eq_ignore_ascii_case("video/h265"))
+        {
             let _ = self.primary_ssrc.compare_exchange(
                 info.ssrc,
                 0,
@@ -101,7 +104,8 @@ impl Interceptor for Repair {
         // readable. Waiting for on_track/first RTP to discover it prevents PLI
         // recovery when the initial keyframe itself never reaches the reader.
         if info.associated_stream.is_none()
-            && info.mime_type.eq_ignore_ascii_case("video/h264")
+            && (info.mime_type.eq_ignore_ascii_case("video/h264")
+                || info.mime_type.eq_ignore_ascii_case("video/h265"))
             && info.ssrc != 0
         {
             self.primary_ssrc.store(info.ssrc, Ordering::Relaxed);

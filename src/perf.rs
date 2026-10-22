@@ -205,7 +205,7 @@ pub fn streamer_capabilities(text: &str) -> Value {
         .take(32)
         .filter_map(|display| display["fps"].as_i64())
         .collect();
-    json!({"parsed":value.is_object(),"video_codecs":codecs,"display_fps":fps})
+    json!({"parsed":caps.is_object(),"complete":caps["video_codec_capability"].as_array().is_some_and(|v|v.len()<=32),"video_codecs":codecs,"display_fps":fps})
 }
 
 /// The internal streamer channel carries JSON statistics in the official
@@ -852,7 +852,7 @@ mod tests {
         assert_eq!(
             streamer_capabilities(&capabilities.to_string()),
             json!({
-                "parsed":true,"display_fps":[60],"video_codecs":[{
+                "parsed":true,"complete":true,"display_fps":[60],"video_codecs":[{
                     "video_codec":1,"width":1440,"height":1080,"codec_impl":37
                 }]
             })

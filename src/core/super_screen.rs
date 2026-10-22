@@ -199,6 +199,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     fn output() -> Output {
         Output {
+            media: Default::default(),
             generation: Some(1),
             events: mpsc::channel().0,
             latest: Arc::new(Mutex::new(None)),

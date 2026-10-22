@@ -64,13 +64,58 @@ pub fn transfers(
         let mut h = hub.lock().unwrap();
         h.jobs.get_mut(job).context("任务不存在")?.transfer_ids = ids.clone();
     }
-    let mut cursor = hub.lock().unwrap().ready(client, id)?.events.seq;
+    let cursor = hub.lock().unwrap().ready(client, id)?.events.seq;
     submit(
         hub,
         client,
         id,
         json!({"op":"transfer_batch","items":items}),
     )?;
+    watch_transfers(hub, client, id, job, ids, cursor)
+}
+pub fn clipboard_transfer(
+    hub: &Shared,
+    client: &str,
+    id: &str,
+    job: &str,
+    mut command: Value,
+) -> Result<Value> {
+    let n = -((transfer_id() as u32 & 0x0fff_ffff).max(1000) as i32
+        + if command["op"] == "clipboard_get" {
+            0x2000_0000
+        } else {
+            0
+        });
+    hub.lock()
+        .unwrap()
+        .jobs
+        .get_mut(job)
+        .context("任务不存在")?
+        .transfer_ids = vec![n];
+    let cursor = hub.lock().unwrap().ready(client, id)?.events.seq;
+    command["queued_id"] = json!(n);
+    submit(hub, client, id, command)?;
+    watch_transfers(hub, client, id, job, vec![n], cursor)
+}
+fn watch_transfers(
+    hub: &Shared,
+    client: &str,
+    id: &str,
+    job: &str,
+    ids: Vec<i32>,
+    mut cursor: u64,
+) -> Result<Value> {
+    let initially_paused = hub.lock().unwrap().jobs[job].paused;
+    if initially_paused {
+        for n in &ids {
+            submit(
+                hub,
+                client,
+                id,
+                json!({"op":"transfer_pause","id":n,"paused":true}),
+            )?;
+        }
+    }
     let start = Instant::now();
     let mut last_change = Instant::now();
     let mut rows = HashMap::<i32, Value>::new();
@@ -99,7 +144,7 @@ pub fn transfers(
                 let done = data["done"].as_u64().unwrap_or(0);
                 let total = data["size"].as_u64().unwrap_or(0);
                 let finished = data["status"] == "已完成";
-                data["percent"] = if data["directory"] == true {
+                data["percent"] = if data["directory"] == true || data["size_known"] == false {
                     if finished { json!(100.0) } else { Value::Null }
                 } else if total > 0 {
                     json!((done as f64 * 100.0 / total as f64).min(100.0))
@@ -131,7 +176,32 @@ pub fn transfers(
             .filter_map(|n| rows.get(n))
             .cloned()
             .collect::<Vec<_>>();
-        let result = json!({"items":values,"elapsed_ms":start.elapsed().as_millis() as u64});
+        let total_known = values.len() == ids.len()
+            && values
+                .iter()
+                .all(|v| v["directory"] != true && v["size_known"] != false && v["size"].is_u64());
+        let bytes: u64 = values.iter().filter_map(|v| v["done"].as_u64()).sum();
+        let size: u64 = values.iter().filter_map(|v| v["size"].as_u64()).sum();
+        let speed: f64 = values
+            .iter()
+            .filter_map(|v| v["bytes_per_second"].as_f64())
+            .sum();
+        let result = json!({"items":values,"elapsed_ms":start.elapsed().as_millis() as u64,"progress":{"bytes":bytes,"total_bytes":if total_known {Some(size)} else {None},"total_known":total_known,"percent":if total_known && size>0 {Some((bytes as f64*100.0/size as f64).min(100.0))} else {None},"bytes_per_second":speed,"items_total":ids.len(),"items_finished":rows.values().filter(|v|terminal_status(&v["status"])).count()}});
+        if let Some(j) = hub.lock().unwrap().jobs.get_mut(job) {
+            if j.paused {
+                last_change = Instant::now();
+            }
+            let active: Vec<_> = values
+                .iter()
+                .filter(|v| !terminal_status(&v["status"]))
+                .collect();
+            if j.paused && !active.is_empty() && active.iter().all(|v| v["status"] == "已暂停") {
+                j.state = "paused".into();
+            } else if !j.paused && !j.cancelled && active.iter().any(|v| v["status"] == "传输中")
+            {
+                j.state = "running".into();
+            }
+        }
         job_update(hub, job, result.clone());
         if ids
             .iter()
@@ -158,37 +228,6 @@ fn terminal_status(v: &Value) -> bool {
     )
 }
 pub fn call(hub: &Shared, client: &str, name: &str, args: &Value) -> Result<Value> {
-    if name == "uu_transfer_control" {
-        let job = str_arg(args, "task_id")?;
-        let action = str_arg(args, "action")?;
-        ensure!(
-            ["pause", "resume", "cancel"].contains(&action),
-            "传输操作无效"
-        );
-        let (id, ids) = {
-            let mut h = hub.lock().unwrap();
-            let j = h.jobs.get_mut(job).context("任务不存在")?;
-            ensure!(j.owner == client, "任务属于其他客户端");
-            ensure!(j.kind == "transfer", "这不是传输任务");
-            if action == "cancel" {
-                j.cancelled = true;
-            }
-            (j.session.clone(), j.transfer_ids.clone())
-        };
-        for n in ids {
-            submit(
-                hub,
-                client,
-                &id,
-                if action == "cancel" {
-                    json!({"op":"transfer_cancel","id":n})
-                } else {
-                    json!({"op":"transfer_pause","id":n,"paused":action=="pause"})
-                },
-            )?;
-        }
-        return Ok(json!({"submitted":true}));
-    }
     let id = sid(args)?;
     match name {
         "uu_files_list" => {

@@ -24,6 +24,19 @@ pub struct Event {
 
 const MAX_APP_DATA: usize = 2 * 1024 * 1024;
 
+/// Capability updates belong to the peer and ICE generation that produced them.
+pub fn forwarded_capabilities(event: &Event, remote: &str, ice: &str) -> Option<Value> {
+    let arg = event.args.first()?;
+    let data = &arg["data"];
+    (event.name == "forward_setting"
+        && !remote.is_empty()
+        && !ice.is_empty()
+        && arg["client_id"] == remote
+        && data["type"] == "device_capability"
+        && data["device_capability"]["ice_id"] == ice)
+        .then(|| crate::perf::streamer_capabilities(&data.to_string()))
+}
+
 /// Official forward_setting envelope (streamer 4.33: 180a8ae90,
 /// SignalAppData parser 180a89040). Socket.IO owns the binary attachment.
 pub fn app_data_envelope(remote: &str, ice: &str) -> Value {
@@ -359,6 +372,19 @@ mod tests {
         event.binary[0].push(1);
         event.name = "soac".into();
         assert!(forwarded_app_data(&event, "peer", "session").is_none());
+    }
+    #[test]
+    fn capability_updates_reject_other_devices_and_connection_generations() {
+        let event = Event {
+            name: "forward_setting".into(),
+            args: vec![
+                json!({"client_id":"peer","data":{"type":"device_capability","device_capability":{"ice_id":"ice","video_codec_capability":[]}}}),
+            ],
+            binary: vec![],
+        };
+        assert!(forwarded_capabilities(&event, "peer", "ice").is_some());
+        assert!(forwarded_capabilities(&event, "peer", "old").is_none());
+        assert!(forwarded_capabilities(&event, "another", "ice").is_none());
     }
     #[test]
     fn socket_binary_ack_framing() {

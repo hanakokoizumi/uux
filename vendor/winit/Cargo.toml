@@ -97,6 +97,7 @@ serde = [
     "dpi/serde",
 ]
 wayland = [
+    "percent-encoding",
     "wayland-client",
     "wayland-backend",
     "wayland-protocols",

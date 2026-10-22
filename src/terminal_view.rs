@@ -9,6 +9,7 @@ pub(super) struct TerminalView {
     size: [u16; 2],
     selection: Option<((u16, u16), (u16, u16))>,
     composing: bool,
+    resize: window_resize::ResizeGrip,
 }
 impl Default for TerminalView {
     fn default() -> Self {
@@ -21,18 +22,13 @@ impl Default for TerminalView {
             size: [100, 30],
             selection: None,
             composing: false,
+            resize: Default::default(),
         }
     }
 }
-pub(super) fn viewport_id() -> egui::ViewportId {
-    crate::backend::terminal_viewport_id()
-}
-
 impl Desktop {
     pub(super) fn open_terminal_for(&mut self, device: Device) {
-        if !self.connected && !self.connecting {
-            self.connect_for_tools(device);
-        }
+        self.connect_for_tools(device);
         self.ui_state.windows.terminal = true;
         if self.connected {
             self.start_terminal();
@@ -95,13 +91,52 @@ impl Desktop {
             return;
         }
         ctx.show_viewport_immediate(
-            viewport_id(),
+            self.viewport("terminal"),
             egui::ViewportBuilder::default()
+                .with_icon(crate::brand::icon())
                 .with_title("终端 — UUX")
                 .with_inner_size([960.0, 640.0])
                 .with_min_inner_size([640.0, 400.0])
+                .with_decorations(false)
                 .with_resizable(true),
             |ui, _| {
+                let resizing = self.ui_state.terminal.resize.intercept(ui.ctx(), true);
+                egui::Panel::top("terminal-title")
+                    .exact_size(36.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(SIDE)
+                            .inner_margin(egui::Margin::symmetric(4, 2)),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, drag) = ui.allocate_exact_size(
+                                Vec2::new((ui.available_width() - 134.0).max(0.0), 32.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            ui.painter().text(
+                                rect.left_center() + Vec2::new(8.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                "终端",
+                                egui::FontId::proportional(12.0),
+                                INK,
+                            );
+                            if !resizing && drag.drag_started() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                            }
+                            if !resizing && drag.double_clicked() {
+                                let maximized =
+                                    ui.input(|i| i.viewport().maximized.unwrap_or(false));
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(
+                                    !maximized,
+                                ));
+                            }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                art::window_buttons,
+                            );
+                        });
+                    });
                 if ui.input(|i| i.viewport().close_requested()) {
                     self.close_terminal();
                     return;
@@ -119,26 +154,35 @@ impl Desktop {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("复制屏幕").clicked() {
+                                    if ui
+                                        .add_sized([88.0, 28.0], egui::Button::new("复制屏幕"))
+                                        .clicked()
+                                    {
                                         ui.ctx().copy_text(
                                             self.ui_state.terminal.parser.screen().contents(),
                                         );
                                     }
                                     if ui
-                                        .add_enabled(
-                                            self.ui_state.terminal.ready,
-                                            egui::Button::new("中断"),
-                                        )
+                                        .add_enabled_ui(self.ui_state.terminal.ready, |ui| {
+                                            ui.add_sized([88.0, 28.0], egui::Button::new("中断"))
+                                        })
+                                        .inner
                                         .on_hover_text("结束当前终端会话并关闭窗口")
                                         .clicked()
                                     {
                                         self.close_terminal();
                                     }
                                     if ui
-                                        .add_enabled(
+                                        .add_enabled_ui(
                                             self.connected && !self.ui_state.terminal.ready,
-                                            egui::Button::new("重新打开"),
+                                            |ui| {
+                                                ui.add_sized(
+                                                    [88.0, 28.0],
+                                                    egui::Button::new("重新打开"),
+                                                )
+                                            },
                                         )
+                                        .inner
                                         .clicked()
                                     {
                                         self.control(json!({"op":"terminal","action":"close"}));
@@ -159,6 +203,8 @@ impl Desktop {
                             .inner_margin(10),
                     )
                     .show(ui, |ui| self.terminal_canvas(ui));
+                self.capture_window(ui.ctx());
+                self.ui_state.terminal.resize.paint_cursor(ui.ctx());
             },
         );
     }

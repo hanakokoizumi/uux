@@ -21,6 +21,10 @@ pub fn unsigned_endpoint(method: &Method, path: &str) -> bool {
             || method == Method::POST
                 && (rest.strip_suffix("/unbind").is_some_and(valid_device_id)
                     || rest.strip_suffix("/reboot").is_some_and(valid_device_id))
+            || method == Method::POST
+                && rest
+                    .strip_suffix("/wake_on_lan/req")
+                    .is_some_and(valid_device_id)
     })
 }
 
@@ -55,6 +59,11 @@ fn request(
             None,
         ),
         "reboot" => (Method::POST, format!("/api/v1/device/{id}/reboot"), None),
+        "wake" => (
+            Method::POST,
+            format!("/api/v1/device/{id}/wake_on_lan/req"),
+            None,
+        ),
         _ => anyhow::bail!("不支持的设备操作"),
     })
 }
@@ -91,6 +100,12 @@ pub async fn perform(cloud: &Cloud, id: &str, op: &str, name: &str) -> Result<()
     if op == "reboot" {
         ensure!(device["status"] == "CONNECTED", "设备已离线");
     }
+    if op == "wake" {
+        ensure!(
+            device["support_wol"] != false,
+            "该设备未启用官方远程开机路径，请在被控端完成开机配置"
+        );
+    }
     let (method, path, body) = request(id, op, name, shared)?;
     cloud.request(method, &path, body, true).await?;
     Ok(())
@@ -111,6 +126,18 @@ mod tests {
         );
         assert!(request("../other", "remove", "", false).is_err());
         assert!(request("abc", "rename", "", false).is_err());
+        assert_eq!(
+            request("abc", "wake", "", false).unwrap().1,
+            "/api/v1/device/abc/wake_on_lan/req"
+        );
+        assert!(unsigned_endpoint(
+            &Method::POST,
+            "/api/v1/device/abc/wake_on_lan/req"
+        ));
+        assert!(!unsigned_endpoint(
+            &Method::POST,
+            "/api/v1/device/../wake_on_lan/req"
+        ));
         assert!(!unsigned_endpoint(&Method::PUT, "/api/v1/device/abc/other"));
         assert!(!unsigned_endpoint(
             &Method::POST,

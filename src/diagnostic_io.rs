@@ -155,6 +155,12 @@ mod tests {
             "diagnostic_probe":{"id":1,"point":[1,0],"rgb":[255,255,255]}}))
         .unwrap();
         let mut frame = VideoFrame {
+            geometry: crate::media_bus::Geometry {
+                screen_id: 0,
+                version: 1,
+                width: 2,
+                height: 2,
+            },
             generation: 2,
             sequence: 1,
             width: 2,

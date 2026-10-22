@@ -106,7 +106,7 @@ impl Ports {
                             let result=bridge(socket,rx,&config,stream_id,sender.clone(),cancel.clone(),&output).await;
                             routes.lock().unwrap().remove(&stream_id);
                             let _=tokio::time::timeout(Duration::from_millis(250),sender.send(Outgoing {frame:frame(config.id,stream_id,1,vec![]),cancel})).await;
-                            if let Err(e)=result {output.native("port_status",json!({"id":config.id,"enabled":true,"status":"failed","message":e.to_string()}));}
+                            if let Err(e)=result {output.native("port_status",json!({"id":config.id,"enabled":true,"listening":true,"scope":"target","last_target_state":"failed","status":"listening","message":format!("监听中，目标连接失败：{e}")}));}
                         });
                     }
                 }
@@ -203,7 +203,7 @@ async fn bridge(
     ensure!(ack["ok"] == true, "远端目标连接失败");
     output.native(
         "port_status",
-        json!({"id":config.id,"enabled":true,"status":"connected","message":"成功"}),
+        json!({"id":config.id,"enabled":true,"listening":true,"scope":"target","last_target_state":"connected","status":"connected","message":"目标已连通"}),
     );
     let mut buffer = vec![0; 32 * 1024];
     loop {
@@ -242,6 +242,7 @@ mod tests {
             target_port: 8008,
         };
         let out = Output {
+            media: Default::default(),
             generation: Some(1),
             events: std::sync::mpsc::channel().0,
             latest: Default::default(),

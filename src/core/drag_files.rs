@@ -45,6 +45,7 @@ fn relative_path(name: &str) -> Result<PathBuf> {
 
 struct Batch {
     task: u32,
+    auto_save: bool,
     list_rpc: i64,
     pending_rpc: Option<i64>,
     count: Option<u32>,
@@ -59,6 +60,7 @@ struct Batch {
     file: Option<File>,
     offset: u64,
     total: u64,
+    max_bytes: Option<u64>,
     done: u64,
     requested: u32,
     paused: bool,
@@ -78,7 +80,7 @@ impl Batch {
         out.native("transfer", json!({"id":self.ui_id(),"name":self.name(),"upload":false,
             "local":self.root,"remote":"被控端拖拽发送","size":self.total,"done":self.done,
             "size_known":self.ready,"initial_offset":0,"elapsed_ms":self.started.elapsed().as_millis() as u64,
-            "status":status,"error":error,"source":"drag","items":self.entries.len()}));
+            "status":status,"error":error,"source":if self.auto_save {"drag"} else {"clipboard"},"items":self.entries.len(),"items_finished":self.index,"paths":self.published}));
     }
     fn manifest(&mut self) -> Result<()> {
         let Some(count) = self.count else {
@@ -124,6 +126,10 @@ impl Batch {
             );
         }
         self.entries = entries;
+        ensure!(
+            self.max_bytes.is_none_or(|limit| total <= limit),
+            "文件超过自动剪贴板接收的剩余缓存容量，请使用文件窗口传输"
+        );
         self.total = total;
         self.ready = true;
         Ok(())
@@ -250,9 +256,76 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 #[derive(Default)]
 pub struct DragFiles {
     batch: Option<Batch>,
+    completed: Option<(u32, Vec<PathBuf>, u64)>,
 }
 
 impl DragFiles {
+    pub fn active(&self, id: u32) -> bool {
+        self.batch.as_ref().is_some_and(|b| b.task == id)
+    }
+    pub fn take_completed(&mut self) -> Option<(u32, Vec<PathBuf>, u64)> {
+        self.completed.take()
+    }
+    pub fn begin(
+        &mut self,
+        destination: &Path,
+        task: Option<u32>,
+        auto_save: bool,
+        out: &Output,
+    ) -> Result<Vec<Vec<u8>>> {
+        self.begin_limited(destination, task, auto_save, None, out)
+    }
+    pub fn begin_limited(
+        &mut self,
+        destination: &Path,
+        task: Option<u32>,
+        auto_save: bool,
+        max_bytes: Option<u64>,
+        out: &Output,
+    ) -> Result<Vec<Vec<u8>>> {
+        ensure!(self.batch.is_none(), "已有文件剪贴板或拖拽接收任务");
+        ensure!(
+            destination.is_absolute() && destination.is_dir(),
+            "请在设置中选择有效的接收文件目录"
+        );
+        let task = task.unwrap_or_else(|| TASK.fetch_add(1, Ordering::Relaxed));
+        let (rpc, message) = request(Req::FileDescListRequest(
+            pb::ClipboardFileDescriptorListRequest { task_id: task },
+        ));
+        self.batch = Some(Batch {
+            task,
+            auto_save,
+            list_rpc: rpc,
+            pending_rpc: None,
+            count: None,
+            segments: Default::default(),
+            entries: vec![],
+            ready: false,
+            root: destination.canonicalize()?,
+            staging: tempfile::Builder::new()
+                .prefix(".uu-drag-")
+                .tempdir_in(destination)?,
+            published: vec![],
+            saved_count: 0,
+            index: 0,
+            file: None,
+            offset: 0,
+            total: 0,
+            max_bytes,
+            done: 0,
+            requested: 0,
+            paused: false,
+            started: Instant::now(),
+            last: Instant::now(),
+        });
+        self.batch.as_ref().unwrap().progress(out, "准备中", None);
+        out.native(
+            "drag_files_started",
+            json!({"directory":destination,"source":if auto_save {"drag"} else {"clipboard"}}),
+        );
+        Ok(vec![message])
+    }
+
     fn abort(&mut self, out: &Output, status: &str, error: Option<&str>) -> Vec<Vec<u8>> {
         let Some(batch) = self.batch.take() else {
             return vec![];
@@ -264,7 +337,7 @@ impl DragFiles {
                 json!({"count":batch.saved_count,"directory":batch.root,"paths":batch.published}),
             );
         }
-        vec![
+        let messages = vec![
             request(Req::AutoSaveComplete(pb::DragDropAutoSaveComplete {
                 total_count: batch.entries.len() as u32,
                 success_count: batch.saved_count,
@@ -275,7 +348,12 @@ impl DragFiles {
                 task_id: batch.task,
             }))
             .1,
-        ]
+        ];
+        if batch.auto_save {
+            messages
+        } else {
+            messages.into_iter().skip(1).collect()
+        }
     }
     fn advance(&mut self, out: &Output) -> Result<Vec<Vec<u8>>> {
         let Some(batch) = self.batch.as_mut() else {
@@ -296,6 +374,7 @@ impl DragFiles {
         );
         if batch.ready && batch.index == batch.entries.len() {
             let saved = batch.commit()?;
+            self.completed = Some((batch.task, saved.clone(), batch.total));
             batch.progress(out, "已完成", None);
             out.native(
                 "drag_files_saved",
@@ -313,6 +392,11 @@ impl DragFiles {
                 }))
                 .1,
             ];
+            let messages = if batch.auto_save {
+                messages
+            } else {
+                messages.into_iter().skip(1).collect()
+            };
             self.batch = None;
             return Ok(messages);
         }
@@ -340,40 +424,7 @@ impl DragFiles {
                         Some("新的拖拽发送替换了上一份文件清单"),
                     ));
                     ensure!(allowed, "当前设置未允许接收拖拽文件");
-                    ensure!(
-                        destination.is_absolute() && destination.is_dir(),
-                        "请在设置中选择有效的接收文件目录"
-                    );
-                    let task = TASK.fetch_add(1, Ordering::Relaxed);
-                    let (rpc, message) = request(Req::FileDescListRequest(
-                        pb::ClipboardFileDescriptorListRequest { task_id: task },
-                    ));
-                    self.batch = Some(Batch {
-                        task,
-                        list_rpc: rpc,
-                        pending_rpc: None,
-                        count: None,
-                        segments: Default::default(),
-                        entries: vec![],
-                        ready: false,
-                        root: destination.canonicalize()?,
-                        staging: tempfile::Builder::new()
-                            .prefix(".uu-drag-")
-                            .tempdir_in(destination)?,
-                        published: vec![],
-                        saved_count: 0,
-                        index: 0,
-                        file: None,
-                        offset: 0,
-                        total: 0,
-                        done: 0,
-                        requested: 0,
-                        paused: false,
-                        started: Instant::now(),
-                        last: Instant::now(),
-                    });
-                    messages.push(message);
-                    out.native("drag_files_started", json!({"directory":destination}));
+                    messages.extend(self.begin(destination, None, true, out)?);
                 }
                 Some(Req::DescSegment(segment)) => {
                     let valid = self
@@ -538,6 +589,7 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     fn output() -> Output {
         Output {
+            media: Default::default(),
             generation: Some(1),
             events: mpsc::channel().0,
             latest: Arc::new(Mutex::new(None)),
@@ -569,6 +621,23 @@ mod tests {
             file_attributes: if directory { 16 } else { 0 },
             ..Default::default()
         }
+    }
+    #[test]
+    fn automatic_clipboard_quota_is_checked_before_opening_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut receiver = DragFiles::default();
+        let out = output();
+        receiver
+            .begin_limited(dir.path(), Some(55), false, Some(10), &out)
+            .unwrap();
+        manifest(
+            &mut receiver,
+            &out,
+            vec![descriptor("large.bin", 11, false)],
+        );
+        assert!(!receiver.active(55));
+        assert!(receiver.take_completed().is_none());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
     }
     fn manifest(
         receiver: &mut DragFiles,

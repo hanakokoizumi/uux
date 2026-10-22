@@ -100,10 +100,13 @@ struct Transfer {
 }
 impl Transfer {
     fn progress(&self, out: &Output, status: &str) {
+        self.progress_error(out, status, None);
+    }
+    fn progress_error(&self, out: &Output, status: &str, error: Option<&str>) {
         out.native(
             "transfer",
             json!({"id":self.id,"name":self.name,"local":self.local,"remote":self.remote,
-            "upload":self.upload,"size":self.size,"done":self.offset,"status":status,
+            "upload":self.upload,"size":self.size,"done":self.offset,"status":status,"error":error,
             "size_known":self.upload || self.ready || self.size > 0,
             "initial_offset":self.initial_offset,"elapsed_ms":self.started.elapsed().as_millis() as u64}),
         );
@@ -647,7 +650,13 @@ impl Files {
                 let Some(t) = self.tasks.get_mut(&id) else {
                     return Ok(vec![]);
                 };
-                ensure!(r.err == 1, "远端拒绝接收文件（{}）", r.err);
+                if r.err != 1 {
+                    return Ok(self.reject_transfer(
+                        id,
+                        &format!("远端拒绝接收文件（{}）", r.err),
+                        out,
+                    ));
+                }
                 t.progress(out, "传输中");
                 return Ok(vec![request(Req::FileAsk(pb::FileTransferAsk {
                     id: task(id),
@@ -660,7 +669,13 @@ impl Files {
                 let Some(t) = self.tasks.get_mut(&id) else {
                     return Ok(vec![]);
                 };
-                ensure!(r.err == 1, "远端文件确认失败（{}）", r.err);
+                if r.err != 1 {
+                    return Ok(self.reject_transfer(
+                        id,
+                        &format!("远端文件确认失败（{}）", r.err),
+                        out,
+                    ));
+                }
                 if r.skip {
                     t.progress(out, "已跳过同名文件");
                     self.tasks.remove(&id);
@@ -682,7 +697,9 @@ impl Files {
                 let Some(t) = self.tasks.get_mut(&id) else {
                     return Ok(vec![]);
                 };
-                ensure!(r.err == 1 && r.block_id == t.block, "远端文件块确认失败");
+                if r.err != 1 || r.block_id != t.block {
+                    return Ok(self.reject_transfer(id, "远端文件块确认失败", out));
+                }
                 t.offset += t.pending as u64;
                 t.pending = 0;
                 t.block += 1;
@@ -697,11 +714,13 @@ impl Files {
                 let Some(t) = self.tasks.get_mut(&id) else {
                     return Ok(vec![]);
                 };
-                ensure!(
-                    r.err == 1 && r.files.len() == 1,
-                    "远端文件请求失败（{}）",
-                    r.err
-                );
+                if r.err != 1 || r.files.len() != 1 {
+                    return Ok(self.reject_transfer(
+                        id,
+                        &format!("远端文件请求失败（{}），返回 {} 项", r.err, r.files.len()),
+                        out,
+                    ));
+                }
                 ensure!(r.files[0].rel_path == t.name, "远端返回了非请求文件");
                 if t.max_size.is_some_and(|limit| r.files[0].size > limit) {
                     t.progress(out, "失败");
@@ -900,6 +919,19 @@ impl Files {
             _ => Ok(vec![]),
         }
     }
+    fn reject_transfer(&mut self, id: i32, reason: &str, out: &Output) -> Vec<Vec<u8>> {
+        if let Some(t) = self.tasks.remove(&id) {
+            t.progress_error(out, "失败", Some(reason));
+        }
+        let mut messages = self
+            .finish_tree_transfer(id, false, out)
+            .unwrap_or_default();
+        messages.push(request(Req::Complete(pb::FileTransferComplete {
+            id: task(id),
+            error: 7,
+        })));
+        messages
+    }
     pub fn close(&mut self, out: &Output) {
         self.close_queue(out);
         self.abort_tree(out);
@@ -955,6 +987,7 @@ mod tests {
     fn output() -> Output {
         let (tx, _) = std::sync::mpsc::channel();
         Output {
+            media: Default::default(),
             generation: Some(1),
             events: tx,
             latest: Default::default(),
@@ -1064,6 +1097,7 @@ mod tests {
         let mut f = Files::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let out = Output {
+            media: Default::default(),
             generation: Some(1),
             events: tx,
             latest: Default::default(),
@@ -1277,6 +1311,41 @@ mod tests {
         assert_eq!(r.id.unwrap().file_index, -1);
         assert!(f.tasks.is_empty());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+    #[test]
+    fn rejected_request_finishes_immediately_and_removes_partial_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut out = output();
+        out.events = tx;
+        let mut files = Files::default();
+        let messages = files
+            .command(
+                &json!({"op":"download","local":dir.path(),"remote":"C:\\absent.bin"}),
+                &out,
+            )
+            .unwrap();
+        let Req::SendRequest(req) = request_value(&messages[0]) else {
+            panic!()
+        };
+        let id = req.id.unwrap().task_id;
+        let replies = files
+            .response(
+                1,
+                pb::FileTransferFtpResponse {
+                    which: Some(Rsp::SendResponse(pb::FileTransferSendResponse {
+                        id: task(id),
+                        err: 7,
+                        ..Default::default()
+                    })),
+                },
+                &out,
+            )
+            .unwrap();
+        assert!(files.tasks.is_empty());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(matches!(request_value(&replies[0]),Req::Complete(c) if c.error == 7));
+        assert!(rx.try_iter().any(|event| matches!(event, crate::backend::Event::Native {kind, data, ..} if kind == "transfer" && data["status"] == "失败" && data["error"].as_str().is_some_and(|e|e.contains("远端文件请求失败")))));
     }
     #[test]
     fn truncated_zlib_list_is_rejected() {

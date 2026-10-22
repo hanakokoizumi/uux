@@ -48,6 +48,18 @@ fn session(items: &[(&str, Value)]) -> Value {
 }
 pub fn catalog() -> Vec<Tool> {
     let mut t = vec![];
+    add(
+        &mut t,
+        "uu_device_power",
+        "对明确指定的设备执行 shutdown/restart/wake。关机和重启会中断远端工作；只确认提交，不声称设备已完成电源操作。wake 使用官方云端唤醒路径，无需远控会话。",
+        &["device_id", "action"],
+        fields(&[
+            ("device_id", string()),
+            ("session_id", string()),
+            ("action", enumeration(&["shutdown", "restart", "wake"])),
+        ]),
+        false,
+    );
     for (name, desc) in [
         ("uu_account_status", "查询原生 UU 账号登录状态，不返回凭据"),
         (
@@ -91,7 +103,10 @@ pub fn catalog() -> Vec<Tool> {
         false,
     );
     for (name, desc) in [
-        ("uu_session_status", "查询连接阶段、工具及画面就绪状态"),
+        (
+            "uu_session_status",
+            "查询会话状态；include 选择 performance/decoder/display/audio/microphone/streams/leases",
+        ),
         (
             "uu_session_close",
             "释放本客户端使用权；保留其他 GUI/MCP 使用方的连接",
@@ -106,7 +121,14 @@ pub fn catalog() -> Vec<Tool> {
             name,
             desc,
             &["session_id"],
-            session(&[]),
+            if name == "uu_session_status" {
+                session(&[(
+                    "include",
+                    json!({"type":"array","items":enumeration(&["performance","decoder","display","audio","microphone","streams","leases"])}),
+                )])
+            } else {
+                session(&[])
+            },
             name != "uu_session_close",
         );
     }
@@ -116,6 +138,7 @@ pub fn catalog() -> Vec<Tool> {
         "返回远端 PNG 图像和 frame_id。键鼠坐标以本次返回图像像素为准，裁剪坐标以完整视频帧像素为准。",
         &["session_id"],
         session(&[
+            ("screen_id", integer()),
             ("max_width", integer()),
             ("wait_ms", integer()),
             (
@@ -144,9 +167,24 @@ pub fn catalog() -> Vec<Tool> {
                     "key_down",
                     "key_up",
                     "release",
+                    "text",
+                    "relative",
+                    "touch",
+                    "button_down",
+                    "button_up",
                 ]),
             ),
+            ("phase", enumeration(&["start", "move", "end", "cancel"])),
+            (
+                "points",
+                json!({"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":fields(&[("id",integer()),("x",json!({"type":"number"})),("y",json!({"type":"number"})),("pressure",json!({"type":"number","minimum":0,"maximum":1}))]),"required":["id","x","y"],"additionalProperties":false}}),
+            ),
             ("frame_id", string()),
+            (
+                "frame",
+                json!({"type":"object","properties":fields(&[("screen_id",integer()),("version",integer()),("width",integer()),("height",integer())]),"required":["screen_id","version","width","height"],"additionalProperties":false}),
+            ),
+            ("text", string()),
             ("x", json!({"type":"number"})),
             ("y", json!({"type":"number"})),
             ("to_x", json!({"type":"number"})),
@@ -177,6 +215,14 @@ pub fn catalog() -> Vec<Tool> {
         session(&[
             ("screen_id", integer()),
             ("super_screen", boolean()),
+            ("codec", enumeration(&["h264", "h265"])),
+            (
+                "local_decoder",
+                json!({"type":"object","properties":{"preference":{"type":"string","enum":["auto","software","vaapi","cuda"]}},"required":["preference"],"additionalProperties":false}),
+            ),
+            ("true_color", boolean()),
+            ("hdr", boolean()),
+            ("dpi", integer()),
             ("width", integer()),
             ("height", integer()),
             ("fps", json!({"type":"integer","enum":[30,60,90,144]})),
@@ -310,10 +356,11 @@ pub fn catalog() -> Vec<Tool> {
     add(
         &mut t,
         "uu_port_update",
-        "修改本客户端的端口映射；启用中的规则会重启监听",
+        "修改 TCP 映射；enabled 启停监听。监听成功不表示远端目标连通。",
         &["session_id", "rule_id"],
         session(&[
             ("rule_id", integer()),
+            ("enabled", boolean()),
             ("name", string()),
             ("local_port", integer()),
             ("target_host", string()),
@@ -423,17 +470,35 @@ pub fn catalog() -> Vec<Tool> {
     add(
         &mut t,
         "uu_clipboard_get",
-        "读取远端文本剪贴板；不修改 Linux 本地剪贴板",
+        "读取 local/remote 剪贴板；图片为 PNG，远端 files 需 destination 并返回接收任务",
         &["session_id"],
-        session(&[]),
+        session(&[
+            ("scope", enumeration(&["local", "remote"])),
+            ("format", enumeration(&["text", "image", "files"])),
+            ("destination", string()),
+        ]),
         true,
     );
     add(
         &mut t,
         "uu_clipboard_set",
-        "写入远端文本剪贴板；不修改 Linux 本地剪贴板",
-        &["session_id", "text"],
-        session(&[("text", string())]),
+        "设置 local/remote 的 text/image/files 剪贴板；远端图片为延迟提供，文件返回任务，等远端实际读取后完成",
+        &["session_id"],
+        session(&[
+            ("scope", enumeration(&["local", "remote"])),
+            ("format", enumeration(&["text", "image", "files"])),
+            ("text", string()),
+            ("frame_id", string()),
+            (
+                "drop",
+                json!({"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"],"additionalProperties":false}),
+            ),
+            ("data_base64", string()),
+            (
+                "paths",
+                json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":1000}),
+            ),
+        ]),
         false,
     );
     add(
@@ -462,6 +527,109 @@ pub fn catalog() -> Vec<Tool> {
             ("query", string()),
             ("limit", integer()),
         ]),
+        true,
+    );
+    add(
+        &mut t,
+        "uu_virtual_screen_create",
+        "创建远端普通虚拟屏，返回任务；仅当远端确认且屏幕列表新增对应资源后完成",
+        &["session_id"],
+        session(&[
+            ("count", json!({"type":"integer","minimum":1,"maximum":4})),
+            ("width", integer()),
+            ("height", integer()),
+        ]),
+        false,
+    );
+    add(
+        &mut t,
+        "uu_virtual_screen_remove",
+        "移除明确指定的普通虚拟屏；不会把关闭视图或退出超级屏当作移除",
+        &["session_id", "screen_ids"],
+        session(&[(
+            "screen_ids",
+            json!({"type":"array","items":integer(),"minItems":1,"maxItems":4,"uniqueItems":true}),
+        )]),
+        false,
+    );
+    // Legacy aliases are dispatch-only, not duplicate public tools.
+    add(
+        &mut t,
+        "uu_stream_open",
+        "订阅当前屏幕真实 H.264/H.265、Opus 媒体；独立持有会话，不切屏或修改画质，不打开本地声音",
+        &["session_id", "screen_id", "tracks"],
+        session(&[
+            ("screen_id", integer()),
+            ("video_format", enumeration(&["encoded", "rgba"])),
+            ("audio_format", enumeration(&["encoded", "pcm"])),
+            (
+                "tracks",
+                json!({"type":"array","items":enumeration(&["video","audio"]),"minItems":1,"maxItems":2,"uniqueItems":true}),
+            ),
+        ]),
+        false,
+    );
+    add(
+        &mut t,
+        "uu_stream_read",
+        "按下一游标读取有界媒体片段。编码包不等同于可播放容器；慢消费者在下一关键帧恢复",
+        &["stream_id", "cursor"],
+        fields(&[
+            ("stream_id", string()),
+            ("cursor", integer()),
+            ("max_bytes", integer()),
+            ("max_duration_ms", integer()),
+            ("wait_ms", integer()),
+        ]),
+        true,
+    );
+    add(
+        &mut t,
+        "uu_stream_close",
+        "只释放当前客户端的媒体订阅",
+        &["stream_id"],
+        fields(&[("stream_id", string())]),
+        false,
+    );
+    add(
+        &mut t,
+        "uu_audio_configure",
+        "设置本会话本地播放或麦克风发送；返回实际状态。设备 ID 来自 uu_capabilities_get",
+        &["session_id", "target", "enabled"],
+        session(&[
+            ("target", enumeration(&["playback", "microphone"])),
+            ("enabled", boolean()),
+            ("device_id", string()),
+        ]),
+        false,
+    );
+    t.retain(|tool| {
+        ![
+            "uu_type_text",
+            "uu_task_cancel",
+            "uu_transfer_control",
+            "uu_port_start",
+            "uu_port_stop",
+        ]
+        .contains(&tool.name.as_ref())
+    });
+    add(
+        &mut t,
+        "uu_task_control",
+        "取消任务；文件传输还支持暂停和继续。返回请求状态，完成以 uu_task_get 为准。",
+        &["task_id", "action"],
+        fields(&[
+            ("task_id", string()),
+            ("action", enumeration(&["cancel", "pause", "resume"])),
+        ]),
+        false,
+    );
+    add(
+        &mut t,
+        "uu_capabilities_get",
+        "查询本机媒体库、音频设备及指定会话报告的能力；未知能力保持 null，不推定官方不支持。",
+        &[],
+        fields(&[("session_id", string())]),
         true,
     );
     t

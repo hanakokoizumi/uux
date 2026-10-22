@@ -3,15 +3,15 @@ use super::*;
 impl Desktop {
     pub(super) fn settings_page(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("设置").font(fonts::bold(24.0)));
-        ui.add_space(18.0);
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.spacing_mut().item_spacing.x = 32.0;
             for (i, name) in ["常规", "安全", "键盘", "网络", "画面", "MCP"]
                 .iter()
                 .enumerate()
             {
                 let (r, response) =
-                    ui.allocate_exact_size(Vec2::new(36.0, 36.0), egui::Sense::click());
+                    ui.allocate_exact_size(Vec2::new(28.0, 36.0), egui::Sense::click());
                 art::hover_background(ui, &response, r.shrink2(Vec2::new(0.0, 4.0)));
                 ui.painter().text(
                     r.center(),
@@ -39,7 +39,7 @@ impl Desktop {
                 }
             }
         });
-        ui.add_space(11.0);
+        ui.add_space(14.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| match self.ui_state.setting_tab {
@@ -51,6 +51,7 @@ impl Desktop {
                 _ => self.mcp_settings(ui),
             });
         self.shortcut_dialog(ui.ctx());
+        self.download_dialog(ui.ctx());
     }
 
     fn mcp_settings(&mut self, ui: &mut egui::Ui) {
@@ -76,11 +77,32 @@ impl Desktop {
                 RichText::new("与当前窗口共用账号和连接；MCP 可在主窗口关闭后继续运行。")
                     .color(MUTED),
             );
-            if ui.button("复制 MCP 配置").clicked() {
-                ui.ctx().copy_text(
-                    serde_json::to_string_pretty(&status["configuration"]).unwrap_or_default(),
-                );
-            }
+            let configuration = mcp_configuration_text(&status);
+            ui.horizontal(|ui| {
+                let copied = self
+                    .ui_state
+                    .mcp_copied_at
+                    .is_some_and(|time| time.elapsed() < Duration::from_secs(3));
+                if ui
+                    .add_enabled(
+                        configuration.is_some(),
+                        egui::Button::new(if copied {
+                            "已复制"
+                        } else {
+                            "复制 MCP 配置"
+                        }),
+                    )
+                    .clicked()
+                    && let Some(configuration) = configuration
+                {
+                    ui.ctx().copy_text(configuration);
+                    self.ui_state.mcp_copied_at = Some(Instant::now());
+                    ui.ctx().request_repaint_after(Duration::from_secs(3));
+                }
+                if status.is_null() {
+                    ui.label(RichText::new("正在加载配置…").color(MUTED));
+                }
+            });
             let clients = status["clients"]
                 .as_array()
                 .into_iter()
@@ -124,7 +146,7 @@ impl Desktop {
                     let label=match task["kind"].as_str().unwrap_or(""){"command"=>"命令执行","transfer"=>"文件传输","display"=>"屏幕设置","search"=>"文件搜索","read_text"=>"读取文本","write_text"=>"写入文本",_=>"任务"};
                     let state=match task["state"].as_str().unwrap_or(""){"running"=>"进行中","completed"=>"已完成","failed"=>"失败","cancelled"=>"已取消","cancelling"=>"正在取消",_=>"等待中"};
                     ui.label(label);ui.label(state);
-                    if task["state"]=="running"&&ui.button("取消").clicked(){self.send(json!({"op":"service_call","name":"uu_task_cancel","arguments":{"task_id":task["task_id"]}}));}
+                    if task["state"]=="running"&&ui.button("取消").clicked(){self.send(json!({"op":"service_call","name":"uu_task_control","arguments":{"task_id":task["task_id"],"action":"cancel"}}));}
                 });
                 if let Some(error)=task["error"].as_str(){ui.label(RichText::new(error).color(MUTED));}
             }
@@ -167,26 +189,7 @@ impl Desktop {
         ) {
             self.ui_state.save();
         }
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                icon(ui, Icon::Folder);
-                ui.vertical(|ui| {
-                    ui.label("接收文件的存储路径");
-                    let r = ui.add(
-                        singleline(&mut self.ui_state.prefs.download)
-                            .desired_width((ui.available_width() - 36.0).max(200.0))
-                            .font(egui::TextStyle::Small),
-                    );
-                    if r.changed() {
-                        self.ui_state.local_path = self.ui_state.prefs.download.clone();
-                        self.ui_state.local_address = self.ui_state.local_path.clone();
-                        self.ui_state.save();
-                        self.control(json!({"op":"drag_receive","enabled":self.ui_state.prefs.drag_receive,"directory":self.ui_state.prefs.download}));
-                    }
-                });
-            });
-        });
+        self.download_settings(ui);
         if setting_toggle(
             ui,
             Icon::Transfer,
@@ -204,7 +207,7 @@ impl Desktop {
                 icon(ui, Icon::Devices);
                 ui.label("关闭主窗口时");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("close-mode")
+                    combo("close-mode")
                         .selected_text(if self.ui_state.prefs.close_minimizes {
                             "最小化到任务栏"
                         } else {
@@ -231,13 +234,95 @@ impl Desktop {
                 });
             });
         });
-        ui.add_space(12.0);
-        note(
-            ui,
-            "远控窗口和文件窗口共用连接；关闭一个窗口不会中断另一个。两个窗口都关闭后自动断开。",
-        );
-        if !self.ui_state.last_notice.is_empty() {
-            note(ui, &self.ui_state.last_notice);
+    }
+
+    fn download_settings(&mut self, ui: &mut egui::Ui) {
+        card().show(ui, |ui| {
+            let (row, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), egui::Sense::hover());
+            art::draw(
+                ui.painter(),
+                egui::Rect::from_center_size(
+                    row.left_center() + Vec2::new(12.0, 0.0),
+                    Vec2::splat(24.0),
+                ),
+                Icon::Folder,
+                INK,
+            );
+            ui.painter().text(
+                row.left_top() + Vec2::new(44.0, 2.0),
+                egui::Align2::LEFT_TOP,
+                "接收文件的存储路径",
+                egui::FontId::proportional(13.0),
+                INK,
+            );
+            let mut job = egui::text::LayoutJob::simple_singleline(
+                self.ui_state.prefs.download.clone(),
+                egui::FontId::proportional(12.0),
+                MUTED,
+            );
+            job.wrap.max_width = (row.width() - 128.0).max(40.0);
+            job.wrap.max_rows = 1;
+            let text = ui.painter().layout_job(job);
+            ui.painter().galley(
+                row.left_bottom() + Vec2::new(44.0, -text.size().y),
+                text,
+                MUTED,
+            );
+            let controls = egui::Rect::from_min_max(
+                egui::pos2(row.right() - 76.0, row.center().y - 16.0),
+                row.right_bottom(),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(controls), |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.horizontal(|ui| {
+                    if art::button(ui, Icon::Edit, "修改存储路径").clicked() {
+                        self.ui_state.download_draft = Some(self.ui_state.prefs.download.clone());
+                    }
+                    if art::button(ui, Icon::Folder, "打开文件夹").clicked() {
+                        let path = std::path::Path::new(&self.ui_state.prefs.download);
+                        if !path.is_dir() {
+                            self.error =
+                                Some("存储目录尚不存在，请修改路径或先在文件管理器中创建。".into());
+                        } else if let Ok(url) = url::Url::from_directory_path(path) {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(url.to_string()));
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(2.0);
+    }
+
+    fn download_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut draft) = self.ui_state.download_draft.take() else {
+            return;
+        };
+        let mut save = false;
+        let mut cancel = false;
+        let response = modal(ctx, "download-directory", |ui| {
+            modal_body(ui, "修改文件存储路径", |ui| {
+                ui.add_sized(
+                    [398.0, 32.0],
+                    singleline(&mut draft).hint_text("请输入本机文件夹的完整路径"),
+                );
+                note(ui, "后续接收的文件将保存至此目录");
+            });
+            (save, cancel) = modal_actions(
+                ui,
+                "保存更改",
+                std::path::Path::new(draft.trim()).is_absolute(),
+                "取消",
+            );
+        });
+        if save {
+            self.ui_state.prefs.download = draft.trim().to_owned();
+            self.ui_state.local_path = self.ui_state.prefs.download.clone();
+            self.ui_state.local_address = self.ui_state.local_path.clone();
+            self.ui_state.save();
+            self.control(json!({"op":"drag_receive","enabled":self.ui_state.prefs.drag_receive,"directory":self.ui_state.prefs.download}));
+        } else if !cancel && !response.should_close() {
+            self.ui_state.download_draft = Some(draft);
         }
     }
 
@@ -267,11 +352,13 @@ impl Desktop {
         if setting_toggle(
             ui,
             Icon::Transfer,
-            "同步文字剪贴板",
-            "允许本机与远端之间双向同步复制的文字",
+            "同步剪贴板",
+            "同步文字和图片；文件粘贴共用文件传输任务",
             &mut self.ui_state.prefs.clipboard,
         ) {
-            self.control(json!({"op":"clipboard_enabled","enabled":self.ui_state.prefs.clipboard}));
+            if !self.ui_state.prefs.clipboard {
+                self.control(json!({"op":"clipboard_focus","enabled":false}));
+            }
             self.ui_state.save();
         }
         if setting_toggle(
@@ -283,12 +370,6 @@ impl Desktop {
         ) {
             self.apply_security();
         }
-        card().show(ui,|ui| {
-            ui.set_width(ui.available_width());
-            ui.label("本机被控与远程协助权限");
-            ui.add_space(8.0);
-            note(ui,"允许同账号控制本机、允许他人协助本机、验证码策略和远程开机，需要被控服务支持。当前 Linux 应用提供主控功能，这些权限仍需在被控电脑上设置。");
-        });
         ui.add_space(2.0);
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -312,34 +393,32 @@ impl Desktop {
     }
 
     fn keyboard_settings(&mut self, ui: &mut egui::Ui) {
-        if setting_toggle(
-            ui,
-            Icon::Keyboard,
-            "使用本机输入法",
-            "将输入法确认后的文字提交到被控设备",
-            &mut self.ui_state.prefs.ime,
-        ) {
-            self.ui_state.save();
-        }
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 icon(ui, Icon::Keyboard);
+                ui.add_space(12.0);
                 ui.vertical(|ui| {
                     ui.label("仅控制端响应的快捷键");
                     note(ui, "远控时以下按键保留在本机，不会传到被控端");
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("添加").clicked() {
+                    if ui
+                        .add_sized([80.0, 24.0], egui::Button::new("添加"))
+                        .clicked()
+                    {
                         self.ui_state.shortcut_capture = Some(usize::MAX);
                     }
                 });
             });
             ui.add_space(14.0);
             ui.separator();
-            ui.add_space(12.0);
+            ui.add_space(6.0);
             if self.ui_state.prefs.local_shortcuts.is_empty() {
-                note(ui, "当前暂无配置");
+                ui.horizontal(|ui| {
+                    ui.add_space(44.0);
+                    note(ui, "当前暂无配置");
+                });
             }
             let mut remove = None;
             for (i, shortcut) in self
@@ -351,12 +430,17 @@ impl Desktop {
                 .enumerate()
             {
                 ui.horizontal(|ui| {
+                    ui.add_space(44.0);
                     ui.label(shortcut);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("删除").clicked() {
+                        if art::sized_icon_button(ui, Icon::Trash, "删除", Vec2::splat(24.0))
+                            .clicked()
+                        {
                             remove = Some(i);
                         }
-                        if ui.small_button("编辑").clicked() {
+                        if art::sized_icon_button(ui, Icon::Edit, "编辑", Vec2::splat(24.0))
+                            .clicked()
+                        {
                             self.ui_state.shortcut_capture = Some(i + 2);
                         }
                     });
@@ -373,9 +457,13 @@ impl Desktop {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 icon(ui, Icon::Keyboard);
+                ui.add_space(12.0);
                 ui.label("功能快捷键");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("还原默认按键").clicked() {
+                    if ui
+                        .add_sized([120.0, 24.0], egui::Button::new("还原默认按键"))
+                        .clicked()
+                    {
                         self.ui_state.prefs.release_shortcut = "Ctrl+Alt+G".into();
                         self.ui_state.prefs.fullscreen_shortcut = "Ctrl+Alt+F".into();
                         self.ui_state.save();
@@ -398,57 +486,61 @@ impl Desktop {
                 ui.separator();
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
+                    ui.add_space(44.0);
                     ui.label(name);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("编辑").clicked() {
+                        if art::sized_icon_button(ui, Icon::Edit, "编辑", Vec2::splat(24.0))
+                            .clicked()
+                        {
                             self.ui_state.shortcut_capture = Some(index);
                         }
-                        ui.label(
-                            RichText::new(shortcut)
-                                .color(BLUE)
-                                .background_color(Color32::from_rgb(233, 244, 255)),
-                        );
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        for key in shortcut.split('+').rev() {
+                            egui::Frame::new()
+                                .fill(Color32::from_rgb(233, 244, 255))
+                                .corner_radius(3)
+                                .inner_margin(egui::Margin::symmetric(6, 3))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(key).size(12.0).color(BLUE));
+                                });
+                        }
                     });
                 });
             }
         });
         ui.add_space(12.0);
-        note(
+        if setting_toggle(
             ui,
-            "窗口失焦时自动释放已按住的键鼠。桌面环境保留的系统快捷键可能先被系统处理。",
-        );
+            Icon::Keyboard,
+            "使用本机输入法",
+            "将输入法确认后的文字提交到被控设备",
+            &mut self.ui_state.prefs.ime,
+        ) {
+            self.ui_state.save();
+        }
     }
 
     fn shortcut_dialog(&mut self, ctx: &egui::Context) {
         let Some(index) = self.ui_state.shortcut_capture else {
             return;
         };
-        let mut open = true;
         let mut candidate = None;
-        dialog("设置快捷键")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .show(ctx, |ui| {
+        let response = modal(ctx, "shortcut-capture", |ui| {
+            modal_body(ui, "设置快捷键", |ui| {
                 ui.label("请按下包含 Ctrl、Alt 或 Shift 的组合键");
-                ui.label("按 Esc 取消");
+                ui.label(RichText::new("按 Esc 取消").size(12.0).color(MUTED));
                 for event in ui.input(|i| i.events.clone()) {
-                    if matches!(
-                        event,
-                        egui::Event::Key {
-                            key: egui::Key::Escape,
-                            pressed: true,
-                            ..
-                        }
-                    ) {
-                        self.ui_state.shortcut_capture = None;
-                        break;
-                    }
                     if let Some(shortcut) = crate::input::shortcut_from_event(&event) {
                         candidate = Some(shortcut);
                     }
                 }
             });
+            modal_cancel(ui, "取消")
+        });
+        if response.inner || response.should_close() {
+            self.ui_state.shortcut_capture = None;
+            return;
+        }
         if let Some(shortcut) = candidate {
             let other = if index == 0 {
                 &self.ui_state.prefs.fullscreen_shortcut
@@ -481,29 +573,19 @@ impl Desktop {
             }
             self.ui_state.shortcut_capture = None;
         }
-        if !open {
-            self.ui_state.shortcut_capture = None;
-        }
     }
 
     fn network_settings(&mut self, ui: &mut egui::Ui) {
-        if setting_toggle(
-            ui,
-            Icon::Devices,
-            "使用中继连接",
-            "直连不稳定时可尝试，重新连接后生效",
-            &mut self.ui_state.prefs.relay_only,
-        ) {
-            self.ui_state.save();
-        }
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 icon(ui, Icon::Devices);
+                ui.add_space(12.0);
                 ui.label("代理设置");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let names = ["系统代理", "不使用代理", "手动设置"];
-                    egui::ComboBox::from_id_salt("proxy-mode")
+                    combo("proxy-mode")
+                        .width(120.0)
                         .selected_text(
                             names
                                 .get(self.ui_state.proxy_draft.mode as usize)
@@ -530,7 +612,7 @@ impl Desktop {
                 ui.scope(|ui| {
                     ui.spacing_mut().interact_size.y = 32.0;
                     proxy_field(ui, "协议类型", |ui| {
-                        egui::ComboBox::from_id_salt("proxy-protocol")
+                        combo("proxy-protocol")
                             .width(180.0)
                             .selected_text(if proxy.scheme == "http" {
                                 "HTTP"
@@ -627,13 +709,40 @@ impl Desktop {
             }
         });
         ui.add_space(12.0);
-        note(
+        if setting_toggle(
             ui,
-            "代理用于账号、登录及设备服务。实时音视频和文件通道仍通过直连或中继协商；当前未接入媒体代理。",
-        );
+            Icon::Devices,
+            "使用中继连接",
+            "直连不稳定时可尝试，重新连接后生效",
+            &mut self.ui_state.prefs.relay_only,
+        ) {
+            self.ui_state.save();
+        }
     }
 
     fn picture_settings(&mut self, ui: &mut egui::Ui) {
+        card().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("本机媒体能力");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("检测设备").clicked() {
+                        self.send(json!({"op":"service_call","name":"uu_capabilities_get","arguments":{}}));
+                    }
+                });
+            });
+            for decoder in self.ui_state.capabilities["local"]["decoders"].as_array().into_iter().flatten() {
+                ui.label(format!("{}  软件解码：{}",decoder["codec"].as_str().unwrap_or(""),if decoder["software_available"]==true {"可用"} else {"不可用"}));
+            }
+            for (kind,label) in [("output","声音输出"),("input","麦克风")] {
+                let devices=&self.ui_state.capabilities["local"]["audio_devices"][kind];
+                for device in devices["devices"].as_array().into_iter().flatten() {
+                    ui.label(format!("{label}：{}{}",device["name"].as_str().unwrap_or("未命名设备"),if device["default"]==true {"（默认）"} else {""}));
+                }
+                if let Some(error)=devices["error"].as_str() {ui.label(error);}
+            }
+        });
+        ui.add_space(12.0);
+
         let mut changed = false;
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -642,7 +751,7 @@ impl Desktop {
                     ui.label(row);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if fps {
-                            egui::ComboBox::from_id_salt("default-fps")
+                            combo("default-fps")
                                 .selected_text(format!("{} 帧", self.ui_state.prefs.fps))
                                 .show_ui(ui, |ui| {
                                     for n in [30, 60, 90, 144] {
@@ -664,7 +773,7 @@ impl Desktop {
                                 (1, "流畅"),
                                 (6, "自定义"),
                             ];
-                            egui::ComboBox::from_id_salt("default-quality")
+                            combo("default-quality")
                                 .selected_text(
                                     modes
                                         .iter()
@@ -722,10 +831,44 @@ impl Desktop {
                 self.apply_capture();
             }
         }
-        ui.add_space(12.0);
-        note(
-            ui,
-            "连接期间可在控制中心选择远端显示器及支持的分辨率。帧率为请求值，实际表现取决于设备和连接。",
+    }
+}
+fn mcp_configuration_text(status: &Value) -> Option<String> {
+    let configuration = &status["configuration"];
+    let server = &configuration["mcpServers"]["uux"];
+    if server["command"]
+        .as_str()
+        .is_none_or(|command| command.trim().is_empty())
+        || server["args"]
+            .as_array()
+            .is_none_or(|args| args.iter().any(|arg| !arg.is_string()))
+    {
+        return None;
+    }
+    serde_json::to_string_pretty(configuration).ok()
+}
+
+#[cfg(test)]
+mod mcp_configuration_tests {
+    use super::*;
+
+    #[test]
+    fn only_complete_configuration_can_be_copied() {
+        for status in [
+            Value::Null,
+            json!({}),
+            json!({"configuration":null}),
+            json!({"configuration":{"mcpServers":{"uux":{"command":null,"args":[]}}}}),
+        ] {
+            assert!(mcp_configuration_text(&status).is_none());
+        }
+        let configuration = json!({"mcpServers":{"uux":{
+            "command":"/home/test/UUX app/uux","args":["--mcp","--state-dir","/home/test/配置"]
+        }}});
+        let copied = mcp_configuration_text(&json!({"configuration":configuration})).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&copied).unwrap(),
+            configuration
         );
     }
 }
@@ -776,7 +919,7 @@ mod tests {
                     ui.spacing_mut().interact_size.y = 32.0;
                     proxy_field(ui, "Protocol", |ui| {
                         rects.push(
-                            egui::ComboBox::from_id_salt("protocol")
+                            combo("protocol")
                                 .width(180.0)
                                 .selected_text("HTTP")
                                 .show_ui(ui, |_| {})

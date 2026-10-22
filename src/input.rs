@@ -10,6 +10,7 @@ pub struct RemoteInput {
     composing: bool,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    touches: BTreeSet<u32>,
     wheel: [f32; 2],
     hover_inside: bool,
 }
@@ -142,11 +143,15 @@ impl RemoteInput {
         }
     }
     pub fn release(&mut self) -> Vec<Value> {
-        let send = self.armed || !self.keys.is_empty() || !self.buttons.is_empty();
+        let send = self.armed
+            || !self.keys.is_empty()
+            || !self.buttons.is_empty()
+            || !self.touches.is_empty();
         self.armed = false;
         self.composing = false;
         self.keys.clear();
         self.buttons.clear();
+        self.touches.clear();
         self.wheel = [0.0; 2];
         if send {
             vec![json!({"op":"release"})]
@@ -208,6 +213,14 @@ impl RemoteInput {
                 out.extend(self.release());
                 continue;
             }
+            if events.iter().any(|e| matches!(e, Event::Touch { .. }))
+                && matches!(
+                    event,
+                    Event::PointerButton { .. } | Event::PointerMoved(_) | Event::PointerGone
+                )
+            {
+                continue;
+            }
             match event {
                 Event::Ime(eframe::egui::ImeEvent::Preedit { text, .. }) if self.armed => {
                     self.composing = !text.is_empty();
@@ -245,6 +258,35 @@ impl RemoteInput {
                         out.push(json!({"op":"up","key":key}));
                     }
                     out.push(json!({"op":"paste_local"}));
+                }
+                Event::Touch {
+                    id,
+                    phase,
+                    pos,
+                    force,
+                    ..
+                } => {
+                    let Ok(id) = u32::try_from(id.0) else {
+                        continue;
+                    };
+                    let phase = match phase {
+                        eframe::egui::TouchPhase::Start => "start",
+                        eframe::egui::TouchPhase::Move => "move",
+                        eframe::egui::TouchPhase::End => "end",
+                        eframe::egui::TouchPhase::Cancel => "cancel",
+                    };
+                    if phase == "start" && rect.contains(*pos) {
+                        self.armed = true;
+                        self.touches.insert(id);
+                    }
+                    if self.touches.contains(&id)
+                        && let Some((x, y)) = coordinates(rect, *pos, size[0], size[1])
+                    {
+                        out.push(json!({"op":"touch","phase":phase,"points":[{"id":id,"x":x,"y":y,"pressure":force.unwrap_or(0.5)}]}));
+                        if phase == "end" || phase == "cancel" {
+                            self.touches.remove(&id);
+                        }
+                    }
                 }
                 Event::PointerButton {
                     pos,

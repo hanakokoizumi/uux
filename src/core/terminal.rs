@@ -161,6 +161,7 @@ mod tests {
             .unwrap();
         assert_eq!(decode(&verify).unwrap(), (9, id, &[][..]));
         let output = Output {
+            media: Default::default(),
             generation: Some(1),
             events: std::sync::mpsc::channel().0,
             latest: Default::default(),
@@ -196,6 +197,7 @@ mod tests {
         let reopened = terminal.command(&json!({"action":"open"})).unwrap();
         let second_id = decode(&reopened).unwrap().1;
         let output = Output {
+            media: Default::default(),
             generation: Some(1),
             events: std::sync::mpsc::channel().0,
             latest: Default::default(),

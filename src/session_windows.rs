@@ -6,6 +6,7 @@ pub(in crate::app) struct SessionWindows {
     pub files: bool,
     pub terminal: bool,
     pub ports: bool,
+    pub clipboard_active: bool,
 }
 impl SessionWindows {
     fn in_use(&self) -> bool {
@@ -25,14 +26,23 @@ pub(in crate::app) struct WindowProbe {
     completed: bool,
 }
 
-pub(in crate::app) fn remote_id() -> egui::ViewportId {
-    crate::backend::remote_viewport_id()
-}
-pub(in crate::app) fn files_id() -> egui::ViewportId {
-    crate::backend::files_viewport_id()
-}
-
 impl Desktop {
+    pub(in crate::app) fn show_remote_window(&mut self) {
+        self.ui_state.windows.remote = true;
+        self.raise_window(self.viewport("remote"));
+    }
+
+    pub(super) fn raise_window(&self, target: egui::ViewportId) {
+        for command in [
+            egui::ViewportCommand::Visible(true),
+            egui::ViewportCommand::Minimized(false),
+            egui::ViewportCommand::Focus,
+        ] {
+            self.context.send_viewport_cmd_to(target, command);
+        }
+        self.context.request_repaint_of(target);
+    }
+
     pub(in crate::app) fn window_probe_timeout(&mut self) {
         let Some(path) = &self.options.window_test else {
             return;
@@ -54,6 +64,8 @@ impl Desktop {
 
     pub(super) fn close_remote_window(&mut self) {
         self.release();
+        self.control(json!({"op":"clipboard_focus","enabled":false}));
+        self.ui_state.windows.clipboard_active = false;
         self.ui_state.windows.remote = false;
         self.ui_state.text_window = false;
         self.ui_state.remote_action = None;
@@ -62,6 +74,15 @@ impl Desktop {
     }
 
     pub(super) fn session_windows(&mut self, ctx: &egui::Context) {
+        if self.ui_state.windows.remote
+            && self.ui_state.screens.iter().all(|screen| {
+                self.ui_state
+                    .hidden_screens
+                    .contains(&(screen["id"].as_i64().unwrap_or(0) as i32))
+            })
+        {
+            self.ui_state.hidden_screens.remove(&self.ui_state.screen);
+        }
         if self.connected && self.ui_state.windows.remote != self.video_wait_requested {
             self.control(json!({"op":"expect_video","enabled":self.ui_state.windows.remote}));
             self.video_wait_requested = self.ui_state.windows.remote;
@@ -70,8 +91,9 @@ impl Desktop {
             let _render = crate::perf::UiScope::new("remote_render");
             let title = self.active_device.as_ref().map_or("远程桌面", |d| &d.name);
             ctx.show_viewport_immediate(
-                remote_id(),
+                self.viewport("remote"),
                 egui::ViewportBuilder::default()
+                    .with_icon(crate::brand::icon())
                     .with_title(format!("{title} — UUX"))
                     .with_inner_size([1280.0, 760.0])
                     .with_min_inner_size([640.0, 400.0])
@@ -109,18 +131,20 @@ impl Desktop {
                         .show(ui, |ui| self.canvas(ui));
                     self.remote_dialogs(ui.ctx());
                     self.ui_state.remote_resize.paint_cursor(ui.ctx());
-                    self.diagnostics(ui.ctx());
+                    self.capture_window(ui.ctx());
                 },
             );
         }
         if self.ui_state.windows.files {
             let _render = crate::perf::UiScope::new("files_render");
             ctx.show_viewport_immediate(
-                files_id(),
+                self.viewport("files"),
                 egui::ViewportBuilder::default()
+                    .with_icon(crate::brand::icon())
                     .with_title("文件传输 — UUX")
                     .with_inner_size([980.0, 620.0])
                     .with_min_inner_size([880.0, 560.0])
+                    .with_resizable(true)
                     .with_decorations(false)
                     .with_active(
                         self.options.screenshot.is_none() || self.options.diagnostic_stdin,
@@ -134,8 +158,13 @@ impl Desktop {
                         return;
                     }
                     ui.input_mut(|i| Self::local_clipboard_events(&mut i.events));
+                    self.ui_state.file_resize.intercept(
+                        ui.ctx(),
+                        self.ui_state.file_dialog.is_none() && !egui::Popup::is_any_open(ui.ctx()),
+                    );
                     self.files_view(ui);
-                    self.diagnostics(ui.ctx());
+                    self.ui_state.file_resize.paint_cursor(ui.ctx());
+                    self.capture_window(ui.ctx());
                 },
             );
         }
@@ -195,6 +224,12 @@ impl Desktop {
     }
 
     fn remote_events(&mut self, ctx: &egui::Context) {
+        let clipboard_active =
+            self.connected && ctx.input(|i| i.focused) && self.ui_state.prefs.clipboard;
+        if clipboard_active != self.ui_state.windows.clipboard_active {
+            self.ui_state.windows.clipboard_active = clipboard_active;
+            self.control(json!({"op":"clipboard_focus","enabled":clipboard_active}));
+        }
         if !ctx.input(|i| i.focused) {
             self.pending_input.clear();
             let values = self.remote_input.suspend();
@@ -298,7 +333,7 @@ impl Desktop {
         let elapsed = started.elapsed().as_secs();
         match self.window_probe.stage {
             0 if elapsed >= 2 => {
-                ctx.send_viewport_cmd_to(remote_id(), egui::ViewportCommand::Close);
+                ctx.send_viewport_cmd_to(self.viewport("remote"), egui::ViewportCommand::Close);
                 self.window_probe.stage = 1;
             }
             1 if !self.ui_state.windows.remote
@@ -312,13 +347,13 @@ impl Desktop {
                 self.window_probe.observations.push(json!({"step":"remote_closed_file_channel_operational",
                     "pass":self.connected && self.ui_state.windows.files && !self.ui_state.windows.remote}));
                 self.ui_state.windows.remote = true;
-                ctx.send_viewport_cmd_to(files_id(), egui::ViewportCommand::Close);
+                ctx.send_viewport_cmd_to(self.viewport("files"), egui::ViewportCommand::Close);
                 self.window_probe.stage = 2;
             }
             2 if elapsed >= 8 && !self.ui_state.windows.files => {
                 self.window_probe.observations.push(json!({"step":"files_closed_remote_still_connected",
                     "pass":self.connected && self.ui_state.windows.remote && self.texture.is_some()}));
-                ctx.send_viewport_cmd_to(remote_id(), egui::ViewportCommand::Close);
+                ctx.send_viewport_cmd_to(self.viewport("remote"), egui::ViewportCommand::Close);
                 self.window_probe.stage = 3;
             }
             3 if !self.connected && !self.connecting => {

@@ -1,13 +1,11 @@
 use crate::backend::VideoFrame;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use bytes::Bytes;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg_next as ffmpeg;
 use std::{
-    collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -18,6 +16,7 @@ use webrtc::rtp::{codecs::h264::H264Packet, packet::Packet, packetizer::Depacket
 /// the *next* timestamp before displaying a complete frame adds arbitrary
 /// latency. Complete contiguous access units are emitted on their RTP marker.
 pub struct AccessUnit {
+    pub codec: &'static str,
     pub data: Bytes,
     pub losses: u64,
     pub assembled_at: Instant,
@@ -34,6 +33,8 @@ pub fn rtp_frame_interval(previous: u32, current: u32) -> Option<Duration> {
 }
 
 pub struct H264Assembler {
+    codec: &'static str,
+    ssrc: Option<u32>,
     next: Option<u16>,
     pending: std::collections::HashMap<u16, Packet>,
     timestamp: Option<u32>,
@@ -49,6 +50,8 @@ pub struct H264Assembler {
 impl Default for H264Assembler {
     fn default() -> Self {
         Self {
+            codec: "h264",
+            ssrc: None,
             next: None,
             pending: Default::default(),
             timestamp: None,
@@ -65,6 +68,20 @@ impl Default for H264Assembler {
 }
 impl H264Assembler {
     pub fn push(&mut self, packet: Packet) -> Vec<AccessUnit> {
+        let codec = if packet.header.payload_type == 104 {
+            "h265"
+        } else {
+            "h264"
+        };
+        if self.ssrc.is_some_and(|ssrc| ssrc != packet.header.ssrc) || self.codec != codec {
+            let losses = self.losses + 1;
+            let late = self.late_packets;
+            *self = Self::default();
+            self.losses = losses;
+            self.late_packets = late;
+        }
+        self.codec = codec;
+        self.ssrc = Some(packet.header.ssrc);
         let sequence = packet.header.sequence_number;
         if let Some(previous) = self.last_packet_at.replace(Instant::now())
             && previous.elapsed() >= Duration::from_millis(1500)
@@ -167,13 +184,18 @@ impl H264Assembler {
                 self.bytes.clear();
                 self.fragment_size = 0;
                 self.depacketizer = Default::default();
-                if !self.depacketizer.is_partition_head(&packet.payload) {
+                if if self.codec == "h265" {
+                    packet.payload.len() < 3
+                        || ((packet.payload[0] >> 1) & 63 == 49 && packet.payload[2] & 0x80 == 0)
+                } else {
+                    !self.depacketizer.is_partition_head(&packet.payload)
+                } {
                     self.timestamp = None;
                     continue;
                 }
                 self.timestamp = Some(timestamp);
             }
-            if !self.valid_payload(&packet.payload) {
+            if self.codec == "h264" && !self.valid_payload(&packet.payload) {
                 self.bytes.clear();
                 self.fragment_size = 0;
                 self.timestamp = None;
@@ -181,10 +203,18 @@ impl H264Assembler {
                 self.losses += 1;
                 continue;
             }
-            match self.depacketizer.depacketize(&packet.payload) {
+            let decoded = if self.codec == "h265" {
+                self.hevc_payload(&packet.payload).ok_or(())
+            } else {
+                self.depacketizer
+                    .depacketize(&packet.payload)
+                    .map_err(|_| ())
+            };
+            match decoded {
                 Ok(data) => self.bytes.extend_from_slice(&data),
                 Err(_) => {
                     self.bytes.clear();
+                    self.fragment_size = 0;
                     self.timestamp = None;
                     self.losses += 1;
                     continue;
@@ -206,6 +236,7 @@ impl H264Assembler {
             }
             if packet.header.marker && !self.bytes.is_empty() {
                 frames.push(AccessUnit {
+                    codec: self.codec,
                     data: Bytes::from(std::mem::take(&mut self.bytes)),
                     losses: self.losses,
                     assembled_at: Instant::now(),
@@ -216,6 +247,85 @@ impl H264Assembler {
             }
         }
         frames
+    }
+    // RFC 7798 §§4.4.1–4.4.3, non-interleaved SDP (sprop-max-don-diff=0).
+    fn hevc_payload(&mut self, data: &[u8]) -> Option<Bytes> {
+        if data.len() < 3 || data[0] & 0x80 != 0 || data[1] & 7 == 0 {
+            return None;
+        }
+        let kind = (data[0] >> 1) & 63;
+        let mut out = Vec::new();
+        match kind {
+            48 => {
+                // Aggregation packets: each complete NAL has a 16-bit length.
+                if self.fragment_size != 0 {
+                    return None;
+                }
+                let mut offset = 2;
+                while offset < data.len() {
+                    let header = data.get(offset..offset + 2)?;
+                    let n = u16::from_be_bytes([header[0], header[1]]) as usize;
+                    offset += 2;
+                    if n < 2 {
+                        return None;
+                    }
+                    let nal = data.get(offset..offset + n)?;
+                    if nal[0] & 0x80 != 0 || nal[1] & 7 == 0 || (nal[0] >> 1) & 63 >= 48 {
+                        return None;
+                    }
+                    out.extend_from_slice(&[0, 0, 0, 1]);
+                    out.extend_from_slice(nal);
+                    offset += n;
+                }
+                if out.is_empty() {
+                    return None;
+                }
+            }
+            49 => {
+                if data.len() < 4 {
+                    return None;
+                }
+                let start = data[2] & 0x80 != 0;
+                let end = data[2] & 0x40 != 0;
+                let nal_type = data[2] & 63;
+                if (start && end) || nal_type >= 48 {
+                    return None;
+                }
+                if start {
+                    if self.fragment_size != 0 {
+                        return None;
+                    }
+                    self.fragment_size = 2;
+                    out.extend_from_slice(&[
+                        0,
+                        0,
+                        0,
+                        1,
+                        (data[0] & 0x81) | (nal_type << 1),
+                        data[1],
+                    ]);
+                } else if self.fragment_size == 0 {
+                    return None;
+                }
+                self.fragment_size += data.len() - 3;
+                if self.fragment_size > 16 * 1024 * 1024 {
+                    return None;
+                }
+                out.extend_from_slice(&data[3..]);
+                if end {
+                    self.fragment_size = 0;
+                }
+            }
+            0..=47 => {
+                if self.fragment_size != 0 {
+                    return None;
+                }
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(data);
+            }
+            _ => return None, // PACI/DONL are not advertised.
+        }
+        Some(Bytes::from(out))
     }
     fn valid_payload(&mut self, data: &[u8]) -> bool {
         if data.is_empty() {
@@ -290,6 +400,7 @@ pub struct Metrics {
 }
 
 pub struct EncodedFrame {
+    pub geometry: crate::media_bus::Geometry,
     pub unit: AccessUnit,
     pub queue_loss: u64,
 }
@@ -299,6 +410,7 @@ pub fn video_decoder(
     latest: Arc<Mutex<Option<VideoFrame>>>,
     metrics: Arc<Metrics>,
     ctx: eframe::egui::Context,
+    media_bus: Arc<crate::media_bus::MediaBus>,
 ) -> mpsc::SyncSender<EncodedFrame> {
     // Retransmission can deliver several completed frames in a single burst.
     // Keep their reference chain intact; the renderer still consumes only the
@@ -307,23 +419,26 @@ pub fn video_decoder(
     std::thread::spawn(move || {
         let result: Result<()> = (|| {
             ffmpeg::init()?;
-            let codec =
-                ffmpeg::decoder::find(ffmpeg::codec::Id::H264).context("FFmpeg 缺少 H264")?;
-            let mut context = ffmpeg::codec::Context::new_with_codec(codec);
-            context.set_threading(ffmpeg::codec::threading::Config {
-                kind: ffmpeg::codec::threading::Type::Slice,
-                count: 2,
-            });
-            context.set_flags(ffmpeg::codec::Flags::LOW_DELAY);
-            let mut decoder = context.decoder().video()?;
+            let mut codec_name = "h264";
+            let mut preference = media_bus.decoder_preference.lock().unwrap().clone();
+            let mut decoder = super::decoder::Decoder::open(codec_name, &preference)?;
             let mut converter = super::pixels::RgbaConverter::default();
             let mut stream_properties = None;
             let mut epoch = (0, 0);
             let mut waiting_keyframe = true;
-            let mut sps = vec![];
-            let mut pps = vec![];
+            let mut parameters = std::collections::BTreeMap::<u8, Vec<u8>>::new();
             while let Ok(frame) = rx.recv() {
                 metrics.queue_time.record(frame.unit.assembled_at.elapsed());
+                let requested = media_bus.decoder_preference.lock().unwrap().clone();
+                if codec_name != frame.unit.codec || requested != preference {
+                    codec_name = frame.unit.codec;
+                    preference = requested;
+                    decoder = super::decoder::Decoder::open(codec_name, &preference)?;
+                    parameters.clear();
+                    waiting_keyframe = true;
+                    stream_properties = None;
+                }
+
                 let data = frame.unit.data;
                 let started = Instant::now();
                 // Loss belongs to a precise point in the queued reference chain.
@@ -331,62 +446,118 @@ pub fn video_decoder(
                 // flushing early can then let corrupt post-loss frames decode unchecked.
                 let current_epoch = (frame.unit.losses, frame.queue_loss);
                 if epoch != current_epoch {
-                    decoder.flush();
+                    decoder.video.flush();
                     waiting_keyframe = true;
                     epoch = current_epoch;
                 }
-                let starts = data
-                    .windows(4)
-                    .enumerate()
-                    .filter_map(|(i, w)| (w == [0, 0, 0, 1]).then_some(i))
-                    .collect::<Vec<_>>();
-                for (i, start) in starts.iter().enumerate() {
-                    if *start + 4 >= data.len() {
+                let mut keyframe = false;
+                for nal in crate::media_bus::annex_b_units(&data) {
+                    let Some(byte) = nal.first() else {
                         continue;
-                    }
-                    let end = starts.get(i + 1).copied().unwrap_or(data.len());
-                    match data[*start + 4] & 31 {
-                        7 => {
-                            if sps != data[*start..end] {
-                                if let Some(parameters) =
-                                    crate::perf::h264_sps(&data[*start + 4..end])
-                                {
-                                    crate::perf::trace("h264_sps", parameters);
-                                }
-                                sps = data[*start..end].to_vec();
-                            }
+                    };
+                    let kind = if codec_name == "h265" {
+                        (byte >> 1) & 63
+                    } else {
+                        byte & 31
+                    };
+                    keyframe |= if codec_name == "h265" {
+                        (16..=21).contains(&kind)
+                    } else {
+                        kind == 5
+                    };
+                    if if codec_name == "h265" {
+                        (32..=34).contains(&kind)
+                    } else {
+                        [7, 8].contains(&kind)
+                    } {
+                        if codec_name == "h264"
+                            && kind == 7
+                            && parameters
+                                .get(&kind)
+                                .is_none_or(|old| old.as_slice() != nal)
+                            && let Some(info) = crate::perf::h264_sps(nal)
+                        {
+                            crate::perf::trace("video_sps", info);
                         }
-                        8 => pps = data[*start..end].to_vec(),
-                        _ => {}
+                        parameters.insert(kind, nal.to_vec());
                     }
                 }
+                let required: &[u8] = if codec_name == "h265" {
+                    &[32, 33, 34]
+                } else {
+                    &[7, 8]
+                };
                 let mut prefixed = None;
                 if waiting_keyframe {
-                    if sps.is_empty()
-                        || pps.is_empty()
-                        || !data
-                            .windows(5)
-                            .any(|w| w[..4] == [0, 0, 0, 1] && w[4] & 31 == 5)
-                    {
+                    if !keyframe || !required.iter().all(|kind| parameters.contains_key(kind)) {
                         metrics.skipped_until_idr.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    let mut packet = sps.clone();
-                    packet.extend_from_slice(&pps);
+                    let mut packet = Vec::new();
+                    for nal in parameters.values() {
+                        packet.extend_from_slice(&[0, 0, 0, 1]);
+                        packet.extend_from_slice(nal);
+                    }
                     packet.extend_from_slice(&data);
                     prefixed = Some(packet);
                     waiting_keyframe = false;
                 }
                 if decoder
+                    .video
                     .send_packet(&ffmpeg::Packet::copy(prefixed.as_deref().unwrap_or(&data)))
                     .is_err()
                 {
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                    if decoder.backend != "software" {
+                        let failed = decoder.backend;
+                        decoder = super::decoder::Decoder::open(codec_name, "software")?;
+                        decoder.fallback =
+                            Some(format!("{failed} 无法解码当前码流，已回退软件解码"));
+                    }
+                    media_bus.request_keyframe.store(true, Ordering::Relaxed);
                     waiting_keyframe = true;
                     continue;
                 }
                 let mut decoded = ffmpeg::frame::Video::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
+                loop {
+                    match decoder.video.receive_frame(&mut decoded) {
+                        Ok(()) => {}
+                        Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                            break;
+                        }
+                        Err(ffmpeg::Error::Eof) => break,
+                        Err(error) => {
+                            metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+                            if decoder.backend != "software" {
+                                decoder = super::decoder::Decoder::open(codec_name, "software")?;
+                                decoder.fallback =
+                                    Some(format!("硬件解码失败，已回退软件解码：{error}"));
+                            } else {
+                                decoder.video.flush();
+                            }
+                            waiting_keyframe = true;
+                            media_bus.request_keyframe.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    let downloaded;
+                    let decoded = if decoder.backend != "software" {
+                        match decoder.software_frame(&decoded) {
+                            Ok(frame) => {
+                                downloaded = frame;
+                                &downloaded
+                            }
+                            Err(error) => {
+                                decoder = super::decoder::Decoder::open(codec_name, "software")?;
+                                decoder.fallback = Some(error.to_string());
+                                waiting_keyframe = true;
+                                media_bus.request_keyframe.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    } else {
+                        &decoded
+                    };
                     metrics.decode_time.record(started.elapsed());
                     let conversion_started = Instant::now();
                     let width = decoded.width();
@@ -395,8 +566,14 @@ pub fn video_decoder(
                         width > 0 && height > 0 && width <= 8192 && height <= 4320,
                         "视频尺寸无效"
                     );
-                    let rate = decoder.frame_rate().map(|rate| (rate.0, rate.1));
-                    let properties = (width, height, rate, decoder.delay(), decoder.has_b_frames());
+                    let rate = decoder.video.frame_rate().map(|rate| (rate.0, rate.1));
+                    let properties = (
+                        width,
+                        height,
+                        rate,
+                        decoder.video.delay(),
+                        decoder.video.has_b_frames(),
+                    );
                     if stream_properties != Some(properties) {
                         stream_properties = Some(properties);
                         crate::perf::trace(
@@ -407,7 +584,14 @@ pub fn video_decoder(
                             }),
                         );
                     }
-                    let rgba = converter.convert(&decoded)?;
+                    let descriptor = decoded.format().descriptor();
+                    *media_bus.decoder.lock().unwrap() = serde_json::json!({"state":"decoding","codec":codec_name,"implementation":"ffmpeg","hardware":decoder.backend!="software","backend":decoder.backend,"preference":preference,"fallback_reason":decoder.fallback,"width":width,"height":height,"pixel_format":descriptor.map(|d|d.name()),"true_color":descriptor.is_some_and(|d|d.nb_components()>=3 && d.log2_chroma_w()==0 && d.log2_chroma_h()==0),"hdr":matches!(decoded.color_transfer_characteristic(),ffmpeg::color::TransferCharacteristic::SMPTE2084|ffmpeg::color::TransferCharacteristic::ARIB_STD_B67),"color_transfer":format!("{:?}",decoded.color_transfer_characteristic()),"presentation":"rgba8_sdr","hdr_conversion":if matches!(decoded.color_transfer_characteristic(),ffmpeg::color::TransferCharacteristic::SMPTE2084|ffmpeg::color::TransferCharacteristic::ARIB_STD_B67) {Some("linear_light_mobius_to_srgb")} else {None}});
+                    let Some(geometry) =
+                        media_bus.dimensions(width, height, frame.geometry.version)
+                    else {
+                        continue;
+                    };
+                    let rgba = converter.convert(decoded)?;
                     metrics.video_size.store(
                         (u64::from(width) << 32) | u64::from(height),
                         Ordering::Relaxed,
@@ -434,6 +618,7 @@ pub fn video_decoder(
                         .decode_us
                         .store(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     *latest.lock().unwrap() = Some(VideoFrame {
+                        geometry,
                         generation,
                         sequence,
                         width: width as usize,
@@ -447,113 +632,16 @@ pub fn video_decoder(
             }
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = result {
             metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
+            *media_bus.decoder.lock().unwrap() =
+                serde_json::json!({"state":"failed","error":error.to_string()});
         }
     });
     tx
 }
 
-pub struct Audio {
-    pub packets: mpsc::SyncSender<Bytes>,
-    pub enabled: Arc<AtomicBool>,
-}
-
-impl Audio {
-    pub fn start(metrics: Arc<Metrics>) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<Bytes>(8);
-        let enabled = Arc::new(AtomicBool::new(true));
-        let active = enabled.clone();
-        std::thread::spawn(move || {
-            let result: Result<()> = (|| {
-                let host = cpal::default_host();
-                let device = host.default_output_device().context("没有默认音频设备")?;
-                let supported = device.default_output_config()?;
-                let config: cpal::StreamConfig = supported.clone().into();
-                let channels = config.channels as usize;
-                let rate = config.sample_rate as usize;
-                let queue = Arc::new(Mutex::new(VecDeque::<f32>::new()));
-                let audio_metrics = metrics.clone();
-                let error = move |_: cpal::StreamError| {
-                    audio_metrics.audio_errors.fetch_add(1, Ordering::Relaxed);
-                };
-                macro_rules! stream {
-                    ($t:ty) => {{
-                        let queue = queue.clone();
-                        let active = active.clone();
-                        device.build_output_stream(
-                            &config,
-                            move |data: &mut [$t], _: &cpal::OutputCallbackInfo| {
-                                let mut queue = queue.lock().unwrap();
-                                for sample in data {
-                                    let value = queue.pop_front().unwrap_or(0.0);
-                                    *sample = cpal::Sample::from_sample(
-                                        if active.load(Ordering::Relaxed) {
-                                            value
-                                        } else {
-                                            0.0
-                                        },
-                                    );
-                                }
-                            },
-                            error,
-                            None,
-                        )?
-                    }};
-                }
-                let stream = match supported.sample_format() {
-                    cpal::SampleFormat::F32 => stream!(f32),
-                    cpal::SampleFormat::I16 => stream!(i16),
-                    cpal::SampleFormat::U16 => stream!(u16),
-                    _ => anyhow::bail!("音频格式不支持"),
-                };
-                stream.play()?;
-                let mut decoder = opus::Decoder::new(48000, opus::Channels::Stereo)?;
-                let mut pcm = vec![0f32; 5760 * 2];
-                while let Ok(bytes) = rx.recv() {
-                    let frames = match decoder.decode_float(&bytes, &mut pcm, false) {
-                        Ok(frames) if frames > 0 => frames,
-                        _ => {
-                            metrics.audio_errors.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                    };
-                    metrics.audio_packets.fetch_add(1, Ordering::Relaxed);
-                    let mut queue = queue.lock().unwrap();
-                    // Bound latency to 120 ms even if the output device stalls.
-                    let max = rate * channels * 120 / 1000;
-                    if queue.len() > max {
-                        let drop = queue.len() - max;
-                        queue.drain(..drop);
-                    }
-                    let output_frames = frames * rate / 48000;
-                    for n in 0..output_frames {
-                        let position = n as f32 * 48000.0 / rate as f32;
-                        let a = (position as usize).min(frames - 1);
-                        let b = (a + 1).min(frames - 1);
-                        let fraction = position - a as f32;
-                        for channel in 0..channels {
-                            let c = channel.min(1);
-                            queue.push_back(
-                                pcm[a * 2 + c] * (1.0 - fraction) + pcm[b * 2 + c] * fraction,
-                            );
-                        }
-                    }
-                }
-                drop(stream);
-                Ok(())
-            })();
-            if result.is_err() {
-                metrics.audio_errors.fetch_add(1, Ordering::Relaxed);
-                eprintln!("远端音频播放不可用，请检查默认输出设备");
-            }
-        });
-        Self {
-            packets: tx,
-            enabled,
-        }
-    }
-}
+pub use super::playback::Audio;
 
 #[cfg(test)]
 mod tests {
@@ -706,5 +794,39 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(a.push(packet(3, 300, true, &[0x65, 1, 2])).len(), 1);
+    }
+    #[test]
+    fn hevc_fragment_reorder_wrap_and_codec_transition() {
+        fn h(seq: u16, marker: bool, payload: &[u8]) -> Packet {
+            let mut p = packet(seq, 100, marker, payload);
+            p.header.payload_type = 104;
+            p
+        }
+        let mut a = H264Assembler::default();
+        assert!(a.push(h(65534, false, &[98, 1, 0x93, 11])).is_empty());
+        assert!(a.push(h(0, true, &[98, 1, 0x53, 33])).is_empty());
+        let frames = a.push(h(65535, false, &[98, 1, 0x13, 22]));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].codec, "h265");
+        assert_eq!(frames[0].data.as_ref(), &[0, 0, 0, 1, 38, 1, 11, 22, 33]);
+        // A new payload codec resets sequence tracking, not just the decoder.
+        let frames = a.push(packet(500, 200, true, &[0x65, 1, 2]));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].codec, "h264");
+        assert!(frames[0].losses > 0);
+    }
+    #[test]
+    fn hevc_aggregation_and_damaged_fragment_are_bounded() {
+        let mut a = H264Assembler::default();
+        assert!(a.hevc_payload(&[98, 1, 0x53, 4]).is_none());
+        assert!(a.hevc_payload(&[98, 1, 0xd3, 4]).is_none());
+        assert!(a.hevc_payload(&[96, 1, 0, 9, 64, 1]).is_none());
+        let bytes = a
+            .hevc_payload(&[96, 1, 0, 3, 64, 1, 9, 0, 3, 66, 1, 8])
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            &[0, 0, 0, 1, 64, 1, 9, 0, 0, 0, 1, 66, 1, 8]
+        );
     }
 }

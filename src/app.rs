@@ -12,7 +12,10 @@ use crate::{
 use base64::Engine;
 use eframe::egui::{self, Color32, RichText, Vec2};
 use serde_json::{Value, json};
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 const BLUE: Color32 = Color32::from_rgb(50, 128, 255);
 const MUTED: Color32 = Color32::from_rgb(136, 138, 139);
@@ -20,6 +23,9 @@ const INK: Color32 = Color32::from_rgb(24, 25, 25);
 const BG: Color32 = Color32::from_rgb(248, 251, 253);
 
 pub struct Desktop {
+    context: egui::Context,
+    window_namespace: u64,
+    other_sessions: Vec<Desktop>,
     ui_state: views::UiState,
     backend: Option<Backend>,
     options: Options,
@@ -45,6 +51,7 @@ pub struct Desktop {
     login_status: String,
     texture: Option<egui::TextureHandle>,
     dimensions: [usize; 2],
+    frame_geometry: Option<crate::media_bus::Geometry>,
     frames: u64,
     last_frame: Option<Instant>,
     remote_input: RemoteInput,
@@ -53,6 +60,11 @@ pub struct Desktop {
     auto_login_sent: bool,
     fullscreen: bool,
     screenshot_requested: bool,
+    diagnostic_capture: Option<(
+        egui::ViewportId,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    )>,
     previews: std::collections::HashMap<String, egui::TextureHandle>,
     window_probe: views::session_windows::WindowProbe,
     display_metrics: crate::perf::DisplayMetrics,
@@ -110,7 +122,12 @@ fn setup(ctx: &egui::Context) {
 impl Desktop {
     pub fn new(cc: &eframe::CreationContext<'_>, options: Options) -> Self {
         setup(&cc.egui_ctx);
-        let result = Backend::shared(options.state_dir.as_deref(), cc.egui_ctx.clone());
+        Self::from_context(&cc.egui_ctx, options)
+    }
+    fn from_context(ctx: &egui::Context, options: Options) -> Self {
+        static NEXT_WINDOW_NAMESPACE: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let result = Backend::shared(options.state_dir.as_deref(), ctx.clone());
         let (backend, error) = match result {
             Ok(b) => (Some(b), None),
             Err(e) => (None, Some(e)),
@@ -119,8 +136,12 @@ impl Desktop {
         ui_state.initial_page(options.view.as_deref());
         let diagnostic_io = options
             .diagnostic_stdin
-            .then(|| crate::diagnostic_io::DiagnosticIo::start(cc.egui_ctx.clone()));
+            .then(|| crate::diagnostic_io::DiagnosticIo::start(ctx.clone()));
         Self {
+            context: ctx.clone(),
+            window_namespace: NEXT_WINDOW_NAMESPACE
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            other_sessions: Vec::new(),
             diagnostic_io,
             ui_state,
             backend,
@@ -147,6 +168,7 @@ impl Desktop {
             login_status: "用 UU 远程手机端扫码，在手机上确认登录".into(),
             texture: None,
             dimensions: [0, 0],
+            frame_geometry: None,
             frames: 0,
             last_frame: None,
             remote_input: RemoteInput::default(),
@@ -155,12 +177,78 @@ impl Desktop {
             auto_login_sent: false,
             fullscreen: false,
             screenshot_requested: false,
+            diagnostic_capture: None,
             previews: Default::default(),
             display_metrics: Default::default(),
             window_probe: Default::default(),
         }
     }
 
+    fn viewport(&self, kind: &str) -> egui::ViewportId {
+        if self.window_namespace == 0 {
+            match kind {
+                "remote" => crate::backend::remote_viewport_id(),
+                "files" => crate::backend::files_viewport_id(),
+                "terminal" => crate::backend::terminal_viewport_id(),
+                _ => crate::backend::ports_viewport_id(),
+            }
+        } else {
+            egui::ViewportId::from_hash_of(("uux-device", self.window_namespace, kind))
+        }
+    }
+    fn activate_device_context(&mut self, device: &Device) -> bool {
+        if self
+            .active_device
+            .as_ref()
+            .is_some_and(|d| d.id == device.id)
+            && (self.connected || self.connecting)
+        {
+            return true;
+        }
+        self.release();
+        let mut others = std::mem::take(&mut self.other_sessions);
+        let existing = others.iter().position(|d| {
+            d.active_device.as_ref().is_some_and(|v| v.id == device.id)
+                && (d.connected || d.connecting)
+        });
+        if existing.is_none() && !self.connected && !self.connecting {
+            self.other_sessions = others;
+            return false;
+        }
+        let mut next = if let Some(index) = existing {
+            others.swap_remove(index)
+        } else {
+            let mut next = Self::from_context(
+                &self.context,
+                Options {
+                    state_dir: self.options.state_dir.clone(),
+                    ..Default::default()
+                },
+            );
+            next.logged_in = self.logged_in;
+            next.state_received = self.state_received;
+            next.nickname = self.nickname.clone();
+            next.devices = self.devices.clone();
+            next
+        };
+        // Main-window/CLI ownership stays with the root. Device state, textures,
+        // native viewports and its IPC client move together without reconnecting.
+        std::mem::swap(&mut self.options, &mut next.options);
+        std::mem::swap(&mut self.diagnostic_io, &mut next.diagnostic_io);
+        std::mem::swap(&mut self.diagnostic_capture, &mut next.diagnostic_capture);
+        std::mem::swap(&mut self.auto_connect_sent, &mut next.auto_connect_sent);
+        std::mem::swap(&mut self.auto_login_sent, &mut next.auto_login_sent);
+        std::mem::swap(
+            &mut self.screenshot_requested,
+            &mut next.screenshot_requested,
+        );
+        std::mem::swap(self, &mut next);
+        others.push(next);
+        self.other_sessions = others;
+        self.selected = Some(device.clone());
+        self.ui_state.select_device_page();
+        existing.is_some()
+    }
     fn send(&mut self, value: Value) -> bool {
         let Some(backend) = &self.backend else {
             return false;
@@ -184,7 +272,22 @@ impl Desktop {
     }
 
     fn inputs(&mut self, values: Vec<Value>) {
-        for command in values {
+        for mut command in values {
+            if matches!(
+                command["op"].as_str(),
+                Some(
+                    "move"
+                        | "relative"
+                        | "click"
+                        | "button_down"
+                        | "button_up"
+                        | "scroll"
+                        | "touch"
+                )
+            ) && let Some(geometry) = self.frame_geometry
+            {
+                command["geometry"] = json!(geometry);
+            }
             if !self.send(json!({"op":"input","generation":self.generation,"command":command})) {
                 break;
             }
@@ -229,6 +332,12 @@ impl Desktop {
         self.connect_with_video(device, false);
     }
     fn connect_with_video(&mut self, device: Device, wait_for_video: bool) {
+        if self.activate_device_context(&device) {
+            if wait_for_video {
+                self.show_remote_window();
+            }
+            return;
+        }
         if self.backend.is_none() {
             return;
         }
@@ -523,7 +632,7 @@ impl Desktop {
                     }),
                 );
             }
-            let remote_id = views::session_windows::remote_id();
+            let remote_id = self.viewport("remote");
             if self.ui_state.windows.remote
                 && ctx.input(|input| input.raw.viewports.contains_key(&remote_id))
             {
@@ -531,6 +640,7 @@ impl Desktop {
             }
             self.frames = frame.sequence;
             self.dimensions = [frame.width, frame.height];
+            self.frame_geometry = Some(frame.geometry);
             self.capture_frame_observed();
             self.last_frame = Some(Instant::now());
         }
@@ -633,14 +743,14 @@ impl Desktop {
             });
     }
 
-    fn diagnostics(&mut self, ctx: &egui::Context) {
+    fn capture_window(&mut self, ctx: &egui::Context) {
         let screenshot_viewport = if self.options.view.as_deref() == Some("ports") {
-            crate::backend::ports_viewport_id()
+            self.viewport("ports")
         } else if self.options.connect.is_some() {
             if self.options.files {
-                views::session_windows::files_id()
+                self.viewport("files")
             } else {
-                views::session_windows::remote_id()
+                self.viewport("remote")
             }
         } else {
             egui::ViewportId::ROOT
@@ -654,17 +764,40 @@ impl Desktop {
         } else {
             self.state_received && !self.refreshing
         };
-        if ready
+        let automatic_capture = ready
             && !self.options.diagnostic_stdin
             && ctx.viewport_id() == screenshot_viewport
             && self.started.elapsed() > Duration::from_secs(3)
-            && !self.screenshot_requested
-            && let Some(path) = self.options.screenshot.clone()
+            && !self.screenshot_requested;
+        if self
+            .diagnostic_capture
+            .as_ref()
+            .is_some_and(|(_, _, done)| done.load(std::sync::atomic::Ordering::Relaxed))
         {
+            self.diagnostic_capture = None;
+        }
+        let manual_capture = self
+            .diagnostic_capture
+            .as_ref()
+            .is_some_and(|(target, _, _)| *target == ctx.viewport_id());
+        let capture_path = if manual_capture {
+            self.diagnostic_capture
+                .as_ref()
+                .map(|(_, path, done)| (path.clone(), done.clone()))
+        } else if automatic_capture {
+            self.options.screenshot.clone().map(|path| {
+                (
+                    path,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((path, captured)) = capture_path {
             self.screenshot_requested = true;
             // eframe 0.37 does not deliver Screenshot callbacks for immediate
             // viewports. Capture our framebuffer after this viewport is painted.
-            let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Debug,
                 egui::Id::unique("diagnostic-capture"),
@@ -700,6 +833,9 @@ impl Desktop {
                 )),
             });
         }
+    }
+
+    fn diagnostics(&mut self, ctx: &egui::Context) {
         if self
             .options
             .quit_after
@@ -715,10 +851,19 @@ impl eframe::App for Desktop {
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
         let _scope = crate::perf::UiScope::new("raw_input");
         if input.focused {
+            for session in &mut self.other_sessions {
+                session.release();
+            }
             let values = self.remote_input.suspend();
             self.inputs(values);
         }
         Self::local_clipboard_events(&mut input.events);
+        if self.options.diagnostic_stdin && !input.dropped_files.is_empty() {
+            println!(
+                "{}",
+                json!({"event":"ui_dropped_files","paths":input.dropped_files.iter().map(|f|f.path()).collect::<Vec<_>>()})
+            );
+        }
         let _ = ctx;
     }
 
@@ -760,24 +905,59 @@ impl eframe::App for Desktop {
                     frame.request_activation_token();
                 }
                 Some("ui_state") => {
-                    let (focused, minimized) =
-                        ctx.input(|i| (i.viewport().focused, i.viewport().minimized));
+                    let target = match command["target"].as_str() {
+                        Some("remote") => self.viewport("remote"),
+                        Some("files") => self.viewport("files"),
+                        _ => egui::ViewportId::ROOT,
+                    };
+                    let (focused, minimized) = ctx.input(|i| {
+                        i.raw
+                            .viewports
+                            .get(&target)
+                            .map(|v| (v.focused, v.minimized))
+                            .unwrap_or_default()
+                    });
                     println!(
                         "{}",
-                        json!({"event":"ui_state","focused":focused,"minimized":minimized})
+                        json!({"event":"ui_state","target":command["target"],"id":command["id"],"focused":focused,"minimized":minimized})
                     );
                 }
                 Some("ui_ping") => {
                     println!("{}", json!({"event":"ui_pong","id":command["id"]}));
                 }
+                Some("ui_capture") => {
+                    // Explicit stdin diagnostics only; this captures our own framebuffer.
+                    let target = match command["target"].as_str() {
+                        Some("remote") => self.viewport("remote"),
+                        Some("files") => self.viewport("files"),
+                        Some("ports") => self.viewport("ports"),
+                        Some("terminal") => self.viewport("terminal"),
+                        _ => egui::ViewportId::ROOT,
+                    };
+                    if let Some(path) = command["path"].as_str() {
+                        self.diagnostic_capture = Some((
+                            target,
+                            PathBuf::from(path),
+                            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        ));
+                        ctx.request_repaint_of(target);
+                    }
+                }
+                Some("ui_dialog") => {
+                    if let Some(target) =
+                        self.diagnostic_dialog(command["name"].as_str().unwrap_or(""))
+                    {
+                        ctx.request_repaint_of(target);
+                    }
+                }
                 Some("open_remote") if self.connected => {
-                    self.ui_state.windows.remote = true;
+                    self.show_remote_window();
                 }
                 Some("viewport") => {
                     let target = match command["target"].as_str() {
                         Some("root") => egui::ViewportId::ROOT,
-                        Some("remote") => crate::backend::remote_viewport_id(),
-                        Some("files") => crate::backend::files_viewport_id(),
+                        Some("remote") => self.viewport("remote"),
+                        Some("files") => self.viewport("files"),
                         _ => continue,
                     };
                     if !ctx.input(|i| i.raw.viewports.contains_key(&target)) {
@@ -787,6 +967,19 @@ impl eframe::App for Desktop {
                         Some("focus") => egui::ViewportCommand::Focus,
                         Some("minimize") => egui::ViewportCommand::Minimized(true),
                         Some("restore") => egui::ViewportCommand::Minimized(false),
+                        Some("resize") => {
+                            let width = command["width"]
+                                .as_f64()
+                                .unwrap_or(920.0)
+                                .clamp(640.0, 2560.0)
+                                as f32;
+                            let height = command["height"]
+                                .as_f64()
+                                .unwrap_or(680.0)
+                                .clamp(400.0, 1440.0)
+                                as f32;
+                            egui::ViewportCommand::InnerSize(Vec2::new(width, height))
+                        }
                         _ => continue,
                     };
                     ctx.send_viewport_cmd_to(target, action);
@@ -800,6 +993,22 @@ impl eframe::App for Desktop {
         }
         self.main_window_close(ctx);
         self.receive(ctx);
+        for session in &mut self.other_sessions {
+            session.receive(ctx);
+        }
+        let mut retained = Vec::new();
+        for session in std::mem::take(&mut self.other_sessions) {
+            if !session.connected
+                && !session.connecting
+                && !session.disconnecting
+                && session.ui_state.can_retire()
+            {
+                std::thread::spawn(move || drop(session));
+            } else {
+                retained.push(session);
+            }
+        }
+        self.other_sessions = retained;
         self.diagnostics(ctx);
         ctx.request_repaint_after_for(Duration::from_millis(100), egui::ViewportId::ROOT);
     }
@@ -807,9 +1016,16 @@ impl eframe::App for Desktop {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let _scope = crate::perf::UiScope::new("root_ui");
         self.render(ui);
+        self.capture_window(ui.ctx());
     }
 
     fn on_exit(&mut self, _: Option<&eframe::glow::Context>) {
+        for session in &mut self.other_sessions {
+            session.release();
+            if let Some(backend) = &mut session.backend {
+                backend.shutdown();
+            }
+        }
         self.release();
         if let Some(backend) = &mut self.backend {
             backend.shutdown();
