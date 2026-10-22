@@ -18,6 +18,8 @@ Windows、macOS 尚未移植，本轮不发布对应产物。i386、aarch64 的 
 
 检查包含格式、Clippy、Rust 单元测试、工作流校验、打包测试、X11 GUI 启动及全新 Debian / Fedora / Arch 容器安装。不会登录账号或连接远端设备。
 
+构建缓存按架构隔离：FFmpeg 与工具链复用 BuildKit 缓存，Cargo 下载与编译结果复用 Actions 缓存。版本号或依赖锁变化时可回退到该架构已有缓存，由 Cargo 检查源代码指纹；编译器或媒体构建环境变化时清理编译产物。Rust 缓存在打包前保存，后续打包失败不会丢失已完成的编译结果。
+
 ## 安装
 
 普通二进制压缩包解压后运行 `./uux`，保留旁边的 `lib/`。系统需 glibc **2.36+**（Debian 12 / Ubuntu 24.04 或更新）、ALSA、PulseAudio 客户端库、Opus、Wayland/X11、OpenGL/EGL、fontconfig。发行版安装包会声明对应依赖；不要求 KDE。

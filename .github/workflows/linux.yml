@@ -75,7 +75,9 @@ jobs:
           tags: uux-builder:${{ matrix.arch }}
           cache-from: type=gha,scope=uux-media-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=uux-media-${{ matrix.arch }}
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Restore Rust dependencies and build outputs
+        id: rust-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             .ci-cache/cargo-${{ matrix.arch }}
@@ -83,7 +85,9 @@ jobs:
           key: linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'ci/linux.Dockerfile', 'ci/build-media.sh') }}-${{ github.sha }}
           restore-keys: |
             linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'ci/linux.Dockerfile', 'ci/build-media.sh') }}-
+            linux-${{ matrix.arch }}-
       - name: Rust checks, native build and GUI smoke test
+        id: build
         env:
           ARCH: ${{ matrix.arch }}
           PLATFORM: ${{ matrix.platform }}
@@ -93,6 +97,14 @@ jobs:
             --user "$(id -u):$(id -g)" -v "$PWD:/work" \
             -e RUN_CHECKS "uux-builder:$ARCH" \
             bash ci/build-linux.sh "$ARCH"
+      - name: Save Rust cache before packaging
+        if: ${{ !cancelled() && steps.rust-cache.outputs.cache-hit != 'true' && steps.build.outcome == 'success' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            .ci-cache/cargo-${{ matrix.arch }}
+            target/ci/${{ matrix.arch }}
+          key: ${{ steps.rust-cache.outputs.cache-primary-key }}
       - name: Create deb, rpm, pacman and binary archives
         env:
           ARCH: ${{ matrix.arch }}

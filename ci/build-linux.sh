@@ -12,6 +12,14 @@ export CARGO_HOME="/work/.ci-cache/cargo-$arch"
 export CARGO_TARGET_DIR="/work/target/ci/$arch"
 export CARGO_BUILD_JOBS=${BUILD_JOBS:-4}
 mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
+# Cargo checks Rust fingerprints itself. Also invalidate native outputs when
+# the compiler/media environment changes, including across fallback cache keys.
+environment=$( { rustc -vV; pkg-config --modversion libavcodec libavutil libavformat libavfilter libswscale; sha256sum ci/linux.Dockerfile ci/build-media.sh; } | sha256sum | cut -d' ' -f1)
+stamp="$CARGO_TARGET_DIR/uux-build-environment"
+if [[ -f "$stamp" && $(cat "$stamp") != "$environment" ]]; then
+    cargo clean --target-dir "$CARGO_TARGET_DIR"
+fi
+printf '%s\n' "$environment" > "$stamp"
 bash ci/check-vulkan-abi.sh
 if [[ ${RUN_CHECKS:-0} == 1 ]]; then
     cargo fmt --all --check
