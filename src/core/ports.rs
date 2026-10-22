@@ -292,6 +292,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&reply, b"reply");
+        // Reserve the probe's source port while the listener still owns its
+        // port. Otherwise Linux can reuse the freed listener port for the
+        // connecting socket and establish a TCP self-connection.
+        let probe = tokio::net::TcpSocket::new_v4().unwrap();
+        probe
+            .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
         let closing = ports.disable(7).await;
         assert!(
             closing
@@ -299,7 +306,8 @@ mod tests {
                 .any(|f| f.r#type == 1 && f.stream_id == syn.stream_id)
         );
         assert!(
-            TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, local_port))
+            probe
+                .connect((std::net::Ipv4Addr::LOCALHOST, local_port).into())
                 .await
                 .is_err()
         );
